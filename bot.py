@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import json
 import time
@@ -13,8 +12,9 @@ from datetime import datetime, timedelta
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HOST = "127.0.0.1"
-PORT = 8080
+# ক্লাউড সার্ভার বাইন্ডিং
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 8080))
 
 CONFIG_FILE = "config.json"
 BINANCE_API_KEY = ""
@@ -359,7 +359,6 @@ def market_engine(symbol):
                 now = time.time()
                 orders = m["dca_orders"]
 
-                # DCA পজিশন পর্যবেক্ষণ ও প্রফিট/স্টপলস হিসাব
                 if len(orders) > 0:
                     total_qty = sum(o["qty"] for o in orders)
                     total_cost = sum(o["cost"] for o in orders)
@@ -370,7 +369,6 @@ def market_engine(symbol):
                     is_take_profit = (diff >= m["take_profit"])
                     is_stop_loss = (not m["no_loss_mode"]) and (diff <= -m["stop_loss"])
 
-                    # ডিপে পুনঃক্রয় (DCA Buy): দাম শেষ বাই থেকে ১.৫% কমলে এবং ৩টির কম থাকলে
                     last_buy = orders[-1]["price"]
                     if (price <= last_buy * 0.985) and (len(orders) < 3) and (now > m["cooldown_until"]):
                         buy_amt = m["amount"]
@@ -414,7 +412,6 @@ def market_engine(symbol):
                         m["unrealized_pnl"] = 0.0
                         m["cooldown_until"] = now + 10
 
-                    # ব্যাকওয়ার্ড কম্প্যাটিবিলিটির জন্য পজিশন ট্র্যাকিং
                     m["position"] = {"buy_price": avg_price, "amount": total_cost} if len(orders) > 0 else None
 
                 elif m["running"]:
@@ -552,7 +549,6 @@ input:checked + .slider:before { transform: translateX(16px); }
 .hist-table { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 4px; }
 .hist-table th, .hist-table td { border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding: 4px 2px; text-align: center; }
 
-/* TACTICAL RADAR HUD STYLING */
 .radar-panel {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-around;
   background: rgba(3, 10, 24, 0.95); border: 1.5px solid var(--cyan);
@@ -668,7 +664,6 @@ input:checked + .slider:before { transform: translateX(16px); }
         </div>
       </div>
 
-      <!-- নতুন যুক্ত হওয়া ট্যাকটিক্যাল রাডার ও DCA HUD -->
       <div class="radar-panel">
         <div class="radar-canvas-box">
           <div style="font-size:11px; color:var(--cyan); font-weight:bold; margin-bottom:6px;">TACTICAL TARGET RADAR</div>
@@ -1059,7 +1054,6 @@ function initPnlCharts() {
 }
 initPnlCharts();
 
-// Tactical Radar HUD Engine
 const rCvs = document.getElementById('masterRadar');
 const rCtx = rCvs.getContext('2d');
 let rAngle = 0;
@@ -1083,7 +1077,6 @@ function drawMasterRadar() {
   rCtx.strokeStyle = 'rgba(255, 0, 119, 0.3)';
   rCtx.stroke();
 
-  // Sweep
   rCtx.save();
   rCtx.translate(cx, cy);
   rCtx.rotate(rAngle);
@@ -1094,7 +1087,6 @@ function drawMasterRadar() {
   rCtx.fill();
   rCtx.restore();
 
-  // Draw Blips
   radarBlips.forEach(b => {
     rCtx.beginPath();
     rCtx.arc(b.x, b.y, b.size, 0, Math.PI*2);
@@ -1123,7 +1115,6 @@ setInterval(()=>{
     const curBal = isLiveTrading ? d.live_balance : d.demo_balance;
     document.getElementById('v-bal').innerText = '$' + curBal.toFixed(2);
     
-    // মেট্রিক্স আপডেট
     const pnl = d.realized_pnl;
     const allEl = document.getElementById('v-all-pnl');
     allEl.innerText = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
@@ -1145,7 +1136,6 @@ setInterval(()=>{
     const winRate = d.total_sells > 0 ? ((d.wins / d.total_sells) * 100).toFixed(1) : "0";
     document.getElementById('v-winrate').innerText = winRate + '%';
 
-    // কয়েন রেট ও DCA ব্যাজ আপডেট
     let hudHtml = '';
     let newBlips = [];
     const symList = Object.keys(d.markets);
@@ -1166,7 +1156,6 @@ setInterval(()=>{
       const dcaEl = document.getElementById('tab-dca-' + sym);
       if(dcaEl) dcaEl.innerText = 'DCA: ' + ords.length + '/3';
 
-      // রাডার ব্লিপ পজিশন
       const a = (idx / symList.length) * Math.PI * 2;
       const dist = 32 + (idx % 3) * 26;
       newBlips.push({
@@ -1177,7 +1166,6 @@ setInterval(()=>{
         name: sym.replace('USDT','')
       });
 
-      // আলাদা কয়েন HUD কার্ড
       hudHtml += `<div class="hud-coin-card ${inTrade ? 'buy-pulse' : ''}">
         <div style="font-size:10px; font-weight:800; color:var(--cyan);">${sym.replace('USDT','')}</div>
         <div style="font-size:10px; color:#fff; margin:2px 0;">$${m.price < 1 ? m.price.toFixed(4) : m.price.toFixed(2)}</div>
@@ -1477,20 +1465,11 @@ class CompleteRouter(BaseHTTPRequestHandler):
         return
 
 def run_server():
-    global PORT
-    for p in range(PORT, PORT + 10):
-        try:
-            srv = ReusableThreadingServer((HOST, p), CompleteRouter)
-            PORT = p
-            print(f"\n==========================================")
-            print(f"Cyberpunk Ultra Terminal + Tactical Radar Active.")
-            print(f"Open in browser: http://127.0.0.1:{p}")
-            print(f"==========================================\n")
-            srv.serve_forever()
-            break
-        except OSError:
-            continue
+    print(f"\n==========================================")
+    print(f"Cyberpunk Ultra Terminal Starting on port {PORT}...")
+    print(f"==========================================\n")
+    srv = ReusableThreadingServer((HOST, PORT), CompleteRouter)
+    srv.serve_forever()
 
 if __name__ == "__main__":
     run_server()
-EOF
