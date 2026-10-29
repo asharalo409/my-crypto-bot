@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ক্লাউড সার্ভার বাইন্ডিং
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8080))
 
@@ -153,22 +152,24 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    try:
-        req = urllib.request.Request("https://api.binance.com/api/v3/time", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            data = json.loads(resp.read().decode())
-            server_time = data["serverTime"]
-            local_time = int(time.time() * 1000)
-            time_offset = server_time - local_time
-    except Exception:
-        pass
+    for ep in ["https://api.binance.com/api/v3/time", "https://api1.binance.com/api/v3/time", "https://data-api.binance.vision/api/v3/time"]:
+        try:
+            req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                server_time = data["serverTime"]
+                local_time = int(time.time() * 1000)
+                time_offset = server_time - local_time
+                return
+        except Exception:
+            continue
 
 sync_binance_time()
 
 def binance_signed_request(endpoint, method="GET", params=None):
     global BINANCE_API_KEY, BINANCE_API_SECRET, time_offset
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key অথবা Secret খালি!"
+        return None, "API Key বা Secret সেট করা নেই"
     try:
         if params is None:
             params = {}
@@ -177,18 +178,22 @@ def binance_signed_request(endpoint, method="GET", params=None):
         params["recvWindow"] = 60000
         query_string = urllib.parse.urlencode(params)
         signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-        full_url = f"https://api.binance.com{endpoint}?{query_string}&signature={signature}"
-        req = urllib.request.Request(full_url, method=method)
-        req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            return json.loads(resp.read().decode()), None
-    except urllib.error.HTTPError as e:
-        try:
-            err_data = json.loads(e.read().decode())
-            return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
-        except Exception:
-            return None, f"HTTP Error {e.code}"
+        
+        base_urls = ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]
+        for base in base_urls:
+            try:
+                full_url = f"{base}{endpoint}?{query_string}&signature={signature}"
+                req = urllib.request.Request(full_url, method=method)
+                req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
+                req.add_header("User-Agent", "Mozilla/5.0")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return json.loads(resp.read().decode()), None
+            except urllib.error.HTTPError as e:
+                err_data = json.loads(e.read().decode())
+                return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
+            except Exception:
+                continue
+        return None, "সকল ব্যাকআপ এপিআই কানেকশন টাইমআউট হয়েছে"
     except Exception as ex:
         return None, str(ex)
 
@@ -200,7 +205,7 @@ def get_live_balance():
         for b in res["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"]), None
-    return 0.0, "USDT Asset পাওয়া যায়নি"
+    return 0.0, "USDT ব্যালেন্স পাওয়া যায়নি"
 
 def get_analytics_metrics():
     try:
@@ -311,26 +316,55 @@ def balance_sync_loop():
                 with lock:
                     if err:
                         if err != last_err:
-                            add_log(f"[বাইনান্স ব্যালেন্স এরর] {err}")
+                            add_log(f"[API লগ] {err}")
                             last_err = err
                     else:
                         bot["live_balance"] = bal
                         if last_err:
-                            add_log(f"[বাইনান্স কানেক্টেড] লাইভ ব্যালেন্স: ${bal:.2f}")
+                            add_log(f"[বাইনান্স লাইভ] ব্যালেন্স: ${bal:.2f}")
                             last_err = ""
-            time.sleep(4)
+            time.sleep(3)
         except Exception:
-            time.sleep(4)
+            time.sleep(3)
 
 threading.Thread(target=balance_sync_loop, daemon=True).start()
+
+def fetch_market_klines(symbol):
+    endpoints = [
+        f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
+        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
+    ]
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return json.loads(r.read().decode())
+        except Exception:
+            continue
+    return None
+
+def fetch_market_depth(symbol):
+    endpoints = [
+        f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5",
+        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5"
+    ]
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return json.loads(r.read().decode())
+        except Exception:
+            continue
+    return {"bids": [], "asks": []}
 
 def market_engine(symbol):
     while True:
         try:
-            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=4) as r:
-                klines = json.loads(r.read().decode())
+            klines = fetch_market_klines(symbol)
+            if not klines or len(klines) == 0:
+                time.sleep(2)
+                continue
 
             price = float(klines[-1][4])
             formatted_klines = [
@@ -338,10 +372,7 @@ def market_engine(symbol):
                 for k in klines
             ]
 
-            req_d = urllib.request.Request(f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5", headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_d, timeout=4) as r:
-                depth = json.loads(r.read().decode())
-
+            depth = fetch_market_depth(symbol)
             bids = depth.get("bids", [])
             asks = depth.get("asks", [])
             tot_bids = sum(float(b[1]) for b in bids) if bids else 1.0
@@ -366,8 +397,8 @@ def market_engine(symbol):
                     diff = ((price - avg_price) / avg_price) * 100
                     m["unrealized_pnl"] = round(diff, 2)
 
-                    is_take_profit = (diff >= m["take_profit"])
-                    is_stop_loss = (not m["no_loss_mode"]) and (diff <= -m["stop_loss"])
+                    is_tp = (diff >= m["take_profit"])
+                    is_sl = (not m["no_loss_mode"]) and (diff <= -m["stop_loss"])
 
                     last_buy = orders[-1]["price"]
                     if (price <= last_buy * 0.985) and (len(orders) < 3) and (now > m["cooldown_until"]):
@@ -377,10 +408,10 @@ def market_engine(symbol):
                         m["cooldown_until"] = now + 15
                         bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
                         add_log(f"[{symbol}] 🟢 DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
-                        send_telegram(f"⚡ *[DCA BUY #{len(orders)}]* {symbol}\nPrice: `${price:.4f}`\nAvg Cost: `${(sum(o['cost'] for o in orders)/sum(o['qty'] for o in orders)):.4f}`")
+                        send_telegram(f"⚡ *[DCA BUY #{len(orders)}]* {symbol}\nPrice: `${price:.4f}`")
                         save_state()
 
-                    elif is_take_profit or is_stop_loss:
+                    elif is_tp or is_sl:
                         revenue = total_qty * price
                         profit = revenue - total_cost
                         bot["demo_balance"] += profit
@@ -397,7 +428,7 @@ def market_engine(symbol):
                         side_name = "TAKE PROFIT" if diff > 0 else "STOP LOSS"
                         bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
                         add_log(f"[{symbol}] 🔴 {side_name} ({len(orders)}x DCA): {profit:+.2f}$ ({diff:+.2f}%)")
-                        send_telegram(f"🎯 *[{side_name}]* {symbol} ({len(orders)}x DCA)\nExit: `${price:.4f}`\nPnL: `{diff:+.2f}%` (`{profit:+.2f}$`)")
+                        send_telegram(f"🎯 *[{side_name}]* {symbol}\nExit: `${price:.4f}`\nPnL: `{diff:+.2f}%`")
                         log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), f"{side_name} ({len(orders)}x DCA)")
                         
                         bot["history"].appendleft({
@@ -426,7 +457,7 @@ def market_engine(symbol):
                         save_state()
                         
                         add_log(f"[{symbol}] 🟢 বেস বাই @ ${price:.4f}")
-                        send_telegram(f"⚡ *[BASE BUY]* {symbol}\nPrice: `${price:.4f}`\nTarget: `+{m['take_profit']}%`")
+                        send_telegram(f"⚡ *[BASE BUY]* {symbol}\nPrice: `${price:.4f}`")
                         log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Base Entry")
                         bot["history"].appendleft({
                             "time": time.strftime("%H:%M:%S"),
@@ -436,7 +467,7 @@ def market_engine(symbol):
                             "pnl": 0.0
                         })
 
-            time.sleep(1.5)
+            time.sleep(1.2)
         except Exception:
             time.sleep(2)
 
@@ -449,7 +480,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CYBERPUNK NEON TERMINAL ULTRA</title>
-<script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
 <style>
@@ -464,31 +495,33 @@ HTML_PAGE = """<!DOCTYPE html>
 [data-theme="oled"] { --bg: #000000; --panel: #0d0d0d; --cyan: #3b82f6; --purple: #3b82f6; --green: #22c55e; --red: #ef4444; --border-cyan: #262626; --border-pink: #3b82f6; }
 
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; }
-body { background-color: var(--bg); color: var(--text); padding: 10px; min-height: 100vh; }
+body { background-color: var(--bg); color: var(--text); padding: 8px; min-height: 100vh; }
 .mono { font-family: 'JetBrains Mono', monospace; }
 .icon { width: 14px; height: 14px; vertical-align: middle; fill: currentColor; display: inline-block; }
 
-.header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 10px; box-shadow: 0 0 10px rgba(255, 0, 119, 0.4); }
+.header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 8px; box-shadow: 0 0 10px rgba(255, 0, 119, 0.4); }
 .header-left { display: flex; align-items: center; gap: 8px; }
-.profile-avatar { width: 34px; height: 34px; border-radius: 50%; border: 2px solid var(--cyan); object-fit: cover; cursor: pointer; }
+.profile-avatar { width: 34px; height: 34px; border-radius: 50%; border: 2px solid var(--cyan); object-fit: cover; }
 .brand { font-size: 13px; font-weight: 900; color: var(--cyan); letter-spacing: 0.5px; display: flex; align-items: center; gap: 5px; }
 
 select { background: #000; color: #fff; border: 1px solid var(--border-cyan); padding: 4px 6px; border-radius: 6px; font-size: 10px; }
 .mode-badge { padding: 5px 12px; border-radius: 8px; font-weight: 800; font-size: 10px; cursor: pointer; transition: 0.2s; user-select: none; }
-.mode-demo { background: rgba(0, 240, 255, 0.2); color: var(--cyan); border: 1.5px solid var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,0.4); }
+.mode-demo { background: rgba(0, 240, 255, 0.2); color: var(--cyan); border: 1.5px solid var(--cyan); }
 .mode-live { background: rgba(255, 0, 68, 0.35); color: #fff; border: 1.5px solid var(--red); box-shadow: 0 0 10px rgba(255,0,68,0.5); }
 
-.page-nav { display: flex; gap: 8px; margin-bottom: 10px; }
-.page-tab-btn { flex: 1; padding: 10px; border-radius: 10px; border: 1.5px solid rgba(255, 0, 119, 0.5); background: var(--panel); color: var(--text-dim); font-weight: 800; font-size: 11px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
-.page-tab-btn.active { background: rgba(0, 240, 255, 0.2); border-color: var(--cyan); color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,0.3); }
+.page-nav { display: flex; gap: 8px; margin-bottom: 8px; }
+.page-tab-btn { flex: 1; padding: 8px; border-radius: 8px; border: 1.5px solid rgba(255, 0, 119, 0.5); background: var(--panel); color: var(--text-dim); font-weight: 800; font-size: 11px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.page-tab-btn.active { background: rgba(0, 240, 255, 0.2); border-color: var(--cyan); color: var(--cyan); }
 
-.analytics-panel { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin-bottom: 10px; }
+.analytics-panel { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin-bottom: 8px; }
+@media(max-width: 600px) { .analytics-panel { grid-template-columns: repeat(3, 1fr); } }
 .an-card { background: var(--panel); border: 1px solid var(--border-pink); border-radius: 8px; padding: 6px 2px; text-align: center; }
 .an-title { font-size: 8px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 2px; font-weight: 700; }
 .an-val { font-size: 12px; font-weight: 800; }
 
-.market-nav { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-bottom: 10px; }
-.market-tab { background: var(--panel); border: 1.5px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 6px 1px; cursor: pointer; text-align: center; position: relative; }
+.market-nav { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-bottom: 8px; overflow-x: auto; }
+@media(max-width: 600px) { .market-nav { grid-template-columns: repeat(4, 1fr); } }
+.market-tab { background: var(--panel); border: 1.5px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 6px 2px; cursor: pointer; text-align: center; }
 .market-tab.active { background: rgba(255, 0, 119, 0.25); border-color: var(--purple); box-shadow: 0 0 8px rgba(255,0,119,0.3); }
 .tab-name { font-size: 10px; font-weight: 900; }
 .tab-price { font-size: 8.5px; font-weight: 700; color: var(--cyan); margin-top: 1px; }
@@ -498,13 +531,13 @@ select { background: #000; color: #fff; border: 1px solid var(--border-cyan); pa
 .view-section { display: none; }
 .view-section.active { display: block; }
 
-.main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
+.main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; }
 @media(max-width: 860px) { .main-grid { grid-template-columns: 1fr; } }
 
-.box { background: var(--panel); border: 1.5px solid var(--border-cyan); border-radius: 10px; padding: 10px; margin-bottom: 10px; box-shadow: 0 0 10px rgba(0,240,255,0.2); }
+.box { background: var(--panel); border: 1.5px solid var(--border-cyan); border-radius: 10px; padding: 10px; margin-bottom: 8px; }
 .box-head { font-size: 12px; font-weight: 800; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: var(--cyan); }
 
-#chart { height: 280px; width: 100%; border-radius: 6px; }
+#chart { height: 280px; width: 100%; border-radius: 6px; position: relative; }
 
 .chart-type-btn { background: transparent; border: 1px solid var(--border-cyan); color: var(--text); padding: 2px 6px; border-radius: 4px; font-size: 9px; cursor: pointer; }
 .chart-type-btn.active { background: var(--cyan); color: #000; font-weight: bold; }
@@ -533,19 +566,18 @@ select { background: #000; color: #fff; border: 1px solid var(--border-cyan); pa
 input:checked + .slider { background-color: var(--green); }
 input:checked + .slider:before { transform: translateX(16px); }
 
-.api-vault-btn { background: rgba(0, 240, 255, 0.15); color: var(--cyan); border: 1.5px solid var(--cyan); border-radius: 6px; padding: 6px 10px; width: 100%; font-size: 11px; font-weight: 800; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; margin-bottom: 8px; }
-.api-vault-modal { display: none; background: rgba(0,0,0,0.85); border: 2px solid var(--purple); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.api-vault-modal input { width: 100%; margin-bottom: 6px; padding: 6px; font-size: 10px; background: #000; color: #fff; border: 1px solid var(--border-pink); border-radius: 4px; }
+.api-vault-btn { background: rgba(0, 240, 255, 0.15); color: var(--cyan); border: 1.5px solid var(--cyan); border-radius: 6px; padding: 8px 10px; width: 100%; font-size: 11px; font-weight: 800; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; margin-bottom: 8px; }
+.api-vault-modal { display: none; background: rgba(0,0,0,0.95); border: 2px solid var(--purple); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.api-vault-modal input { width: 100%; margin-bottom: 6px; padding: 6px; font-size: 11px; background: #000; color: #fff; border: 1px solid var(--border-pink); border-radius: 4px; }
 
 .btn { width: 100%; padding: 8px; border: none; border-radius: 6px; font-weight: 800; cursor: pointer; font-size: 11px; margin-top: 4px; }
 .btn-save { background: rgba(255, 0, 119, 0.3); color: #fff; border: 1.5px solid var(--purple); margin-bottom: 5px; }
 .btn-manual-buy { background: rgba(0, 255, 102, 0.25); color: var(--green); border: 1.5px solid var(--green); }
 .btn-manual-sell { background: rgba(255, 0, 68, 0.3); color: #fff; border: 1.5px solid var(--red); }
-.btn-tg-test { background: rgba(0, 240, 255, 0.2); color: var(--cyan); border: 1.5px solid var(--cyan); margin-bottom: 5px; }
 .btn-on { background: linear-gradient(135deg, var(--green), #00f0ff); color: #021208; font-weight: 900; }
 .btn-off { background: linear-gradient(135deg, var(--red), var(--purple)); color: #fff; font-weight: 900; }
 
-.log-box { background: #000; border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px; height: 80px; overflow-y: hidden; font-size: 10px; line-height: 1.5; color: var(--cyan); }
+.log-box { background: #000; border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px; height: 90px; overflow-y: hidden; font-size: 10px; line-height: 1.5; color: var(--cyan); }
 .hist-table { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 4px; }
 .hist-table th, .hist-table td { border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding: 4px 2px; text-align: center; }
 
@@ -553,13 +585,11 @@ input:checked + .slider:before { transform: translateX(16px); }
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-around;
   background: rgba(3, 10, 24, 0.95); border: 1.5px solid var(--cyan);
   border-radius: 10px; padding: 12px; margin-top: 10px;
-  box-shadow: 0 0 15px rgba(0, 240, 255, 0.2);
 }
 .radar-canvas-box { text-align: center; }
 #masterRadar {
   background: radial-gradient(circle, #022033 0%, #030a17 80%);
   border-radius: 50%; border: 2px solid var(--cyan);
-  box-shadow: 0 0 15px var(--cyan) inset;
 }
 .radar-hud-grid {
   display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
@@ -568,254 +598,145 @@ input:checked + .slider:before { transform: translateX(16px); }
 @media(max-width: 600px) { .radar-hud-grid { grid-template-columns: repeat(2, 1fr); margin-left: 0; margin-top: 10px; } }
 .hud-coin-card {
   background: #081026; border: 1px solid #1e293b; border-radius: 6px;
-  padding: 6px; text-align: center; position: relative;
+  padding: 6px; text-align: center;
 }
-.hud-coin-card.buy-pulse { border-color: var(--green); box-shadow: 0 0 10px var(--green); }
-.hud-coin-card.sell-pulse { border-color: var(--red); box-shadow: 0 0 10px var(--red); }
 </style>
 </head>
 <body>
 
 <div class="header">
   <div class="header-left">
-    <input type="file" id="avatar-input" accept="image/*" style="display:none;" onchange="saveProfilePic(event)">
-    <img id="user-avatar" class="profile-avatar" title="ছবি পরিবর্তন করতে চাপুন" onclick="document.getElementById('avatar-input').click()" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='34' height='34' viewBox='0 0 24 24' fill='%2300f0ff'><circle cx='12' cy='8' r='4'/><path d='M12 14c-5 0-8 3-8 6v1h16v-1c0-3-3-6-8-6z'/></svg>">
-    <div class="brand">
-      <svg class="icon" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-      CYBERPUNK NEON TERMINAL
-    </div>
+    <img id="user-avatar" class="profile-avatar" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='34' height='34' viewBox='0 0 24 24' fill='%2300f0ff'><circle cx='12' cy='8' r='4'/><path d='M12 14c-5 0-8 3-8 6v1h16v-1c0-3-3-6-8-6z'/></svg>">
+    <div class="brand">⚡ CYBERPUNK NEON ULTRA</div>
   </div>
-
   <div style="display:flex; align-items:center; gap:5px;">
     <select onchange="applyTheme(this.value)">
       <option value="cyberpunk">Cyberpunk Neon</option>
       <option value="binance">Binance Dark</option>
       <option value="tokyo">Tokyo Midnight</option>
       <option value="matrix">Matrix Green</option>
-      <option value="oled">OLED Pitch Black</option>
+      <option value="oled">OLED Black</option>
     </select>
     <div class="mode-badge mode-demo" id="mode-toggle" onclick="toggleTradingMode()">DEMO MODE</div>
-    <select id="lang-sel">
-      <option value="bn">বাংলা</option>
-      <option value="en">English</option>
-    </select>
   </div>
-</div>
-
-<div class="page-nav">
-  <button class="page-tab-btn active" id="tab-btn-trade" onclick="switchPage('trade')">
-    <svg class="icon" viewBox="0 0 24 24"><path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/></svg>
-    <span>লাইভ ট্রেডিং টার্মিনাল</span>
-  </button>
-  <button class="page-tab-btn" id="tab-btn-pnl" onclick="switchPage('pnl')">
-    <svg class="icon" viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2V7h2v10zm4 0h-2v-4h2v4z"/></svg>
-    <span>লাভ-লস ও গ্রাফ অ্যানালিটিক্স</span>
-  </button>
 </div>
 
 <div class="analytics-panel">
   <div class="an-card"><div class="an-title">মোট লাভ / ক্ষতি</div><div class="an-val mono" id="v-all-pnl" style="color:var(--green);">$0.00</div></div>
-  <div class="an-card"><div class="an-title">গত ১ ঘণ্টার লাভ</div><div class="an-val mono" id="v-1h-pnl">$0.00</div><div style="font-size:7.5px; color:var(--text-dim);" id="v-1h-tr">০টি ট্রেড</div></div>
-  <div class="an-card"><div class="an-title">আজকের লাভ (২৪ ঘণ্টা)</div><div class="an-val mono" id="v-24h-pnl">$0.00</div><div style="font-size:7.5px; color:var(--text-dim);" id="v-24h-tr">০টি ট্রেড</div></div>
-  <div class="an-card"><div class="an-title">মোট বাই / সেল</div><div class="an-val mono" style="font-size:10px;"><span style="color:var(--green);" id="v-tot-buy">0 BUY</span> / <span style="color:var(--red);" id="v-tot-sell">0 SELL</span></div></div>
-  <div class="an-card"><div class="an-title">উইন রেট (Win%)</div><div class="an-val mono" id="v-winrate" style="color:var(--cyan);">0%</div></div>
+  <div class="an-card"><div class="an-title">১ ঘণ্টার লাভ</div><div class="an-val mono" id="v-1h-pnl">$0.00</div></div>
+  <div class="an-card"><div class="an-title">২৪ ঘণ্টার লাভ</div><div class="an-val mono" id="v-24h-pnl">$0.00</div></div>
+  <div class="an-card"><div class="an-title">বাই / সেল</div><div class="an-val mono"><span style="color:var(--green);" id="v-tot-buy">0</span> / <span style="color:var(--red);" id="v-tot-sell">0</span></div></div>
+  <div class="an-card"><div class="an-title">উইন রেট</div><div class="an-val mono" id="v-winrate" style="color:var(--cyan);">0%</div></div>
   <div class="an-card"><div class="an-title">USDT ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--green);">$1000.00</div></div>
 </div>
 
-<div id="view-trade" class="view-section active">
-  <div class="market-nav">
-    <div class="market-tab active" onclick="selectMarket('BTCUSDT', this)"><div class="tab-name">BTC</div><div class="tab-price mono" id="tab-price-BTCUSDT">$0.00</div><div class="tab-status" id="tab-st-BTCUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-BTCUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('ETHUSDT', this)"><div class="tab-name">ETH</div><div class="tab-price mono" id="tab-price-ETHUSDT">$0.00</div><div class="tab-status" id="tab-st-ETHUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-ETHUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('SOLUSDT', this)"><div class="tab-name">SOL</div><div class="tab-price mono" id="tab-price-SOLUSDT">$0.00</div><div class="tab-status" id="tab-st-SOLUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-SOLUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('BNBUSDT', this)"><div class="tab-name">BNB</div><div class="tab-price mono" id="tab-price-BNBUSDT">$0.00</div><div class="tab-status" id="tab-st-BNBUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-BNBUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('XRPUSDT', this)"><div class="tab-name">XRP</div><div class="tab-price mono" id="tab-price-XRPUSDT">$0.00</div><div class="tab-status" id="tab-st-XRPUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-XRPUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('ADAUSDT', this)"><div class="tab-name">ADA</div><div class="tab-price mono" id="tab-price-ADAUSDT">$0.00</div><div class="tab-status" id="tab-st-ADAUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-ADAUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('DOGEUSDT', this)"><div class="tab-name">DOGE</div><div class="tab-price mono" id="tab-price-DOGEUSDT">$0.00</div><div class="tab-status" id="tab-st-DOGEUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-DOGEUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('AVAXUSDT', this)"><div class="tab-name">AVAX</div><div class="tab-price mono" id="tab-price-AVAXUSDT">$0.00</div><div class="tab-status" id="tab-st-AVAXUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-AVAXUSDT">DCA: 0/3</div></div>
-  </div>
-
-  <div class="main-grid">
-    <div>
-      <div class="box">
-        <div class="box-head">
-          <span>লাইভ ক্যান্ডেল চার্ট: <b style="color:var(--cyan);" id="chart-sym">BTCUSDT</b></span>
-          <div style="display:flex; gap:3px;">
-            <button class="chart-type-btn active" onclick="switchChartType('candlestick', this)">ক্যান্ডেল</button>
-            <button class="chart-type-btn" onclick="switchChartType('area', this)">এরিয়া</button>
-            <button class="chart-type-btn" onclick="switchChartType('line', this)">লাইন</button>
-            <button class="chart-type-btn" onclick="switchChartType('bar', this)">বার</button>
-          </div>
-        </div>
-        <div id="chart"></div>
-
-        <div class="sentiment-box">
-          <div style="display:flex; justify-content:space-between; font-size:10px;">
-            <span style="color:var(--green); font-weight:800;">ক্রেতা শক্তি: <span id="buy-pct">50%</span></span>
-            <span style="color:var(--red); font-weight:800;">বিক্রেতা শক্তি: <span id="sell-pct">50%</span></span>
-          </div>
-          <div class="bar-wrap">
-            <div class="bar-fill" id="buy-bar" style="width: 50%;"></div>
-          </div>
-        </div>
-
-        <div class="ob-grid mono">
-          <div><b style="color:var(--green);">BIDS (ক্রয়াদেশ)</b><table class="ob-table" id="bids-list"></table></div>
-          <div><b style="color:var(--red);">ASKS (বিক্রয়াদেশ)</b><table class="ob-table" id="asks-list"></table></div>
-        </div>
-      </div>
-
-      <div class="radar-panel">
-        <div class="radar-canvas-box">
-          <div style="font-size:11px; color:var(--cyan); font-weight:bold; margin-bottom:6px;">TACTICAL TARGET RADAR</div>
-          <canvas id="masterRadar" width="220" height="220"></canvas>
-          <div id="radarEventText" class="mono" style="font-size:10px; color:var(--green); margin-top:6px;">RADAR: SCANNING 8 PAIRS</div>
-        </div>
-        <div class="radar-hud-grid mono" id="hudGrid"></div>
-      </div>
-    </div>
-
-    <div>
-      <button class="api-vault-btn" onclick="toggleApiVault()">
-        <svg class="icon" viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-        <span>Binance API ভল্ট (গোপন ও এনক্রিপ্টেড)</span>
-      </button>
-
-      <div class="api-vault-modal" id="api-vault-box">
-        <div style="font-size:10px; color:var(--purple); font-weight:bold; margin-bottom:5px;">Binance API Key ও Secret:</div>
-        <input type="password" id="api-key" placeholder="API Key পেস্ট করুন" class="mono" autocomplete="off">
-        <input type="password" id="api-sec" placeholder="Secret Key পেস্ট করুন" class="mono" autocomplete="off">
-        <div style="display:flex; gap:5px; margin-bottom:5px;">
-          <button class="btn" style="padding:5px; font-size:10px; background:#222; color:#fff;" onclick="toggleSecretVisibility()">দেখুন / লুকান</button>
-          <button class="btn btn-save" style="margin:0; padding:5px; font-size:10px;" onclick="saveApiKeys()">সংরক্ষণ করুন</button>
-        </div>
-        <button class="btn" style="background:#550011; color:#ff6688; border:1px solid #ff0044; padding:5px; font-size:10px;" onclick="clearApiKeys()">কী মুছুন / রিসেট</button>
-      </div>
-
-      <div class="box">
-        <div class="box-head">
-          <span id="cfg-sym">BTCUSDT</span>
-          <span id="active-pnl-label" class="mono" style="font-size:10px; color:var(--text-dim);">ওপেন ট্রেড: নাই</span>
-        </div>
-
-        <div class="toggle-switch-row">
-          <span style="color:var(--green); font-weight:bold;">🛡️ নো-লস মোড (লাভ ছাড়া সেল নয়):</span>
-          <label class="switch">
-            <input type="checkbox" id="no-loss-chk" checked onchange="toggleNoLoss(this.checked)">
-            <span class="slider"></span>
-          </label>
-        </div>
-
-        <div class="row"><span>ট্রেড সাইজ ($):</span><input class="mono" id="amt" type="number" value="10"></div>
-        <div class="row"><span>স্টপ লস (%):</span><input class="mono" id="sl" type="number" step="0.01" value="50.0"></div>
-        <div class="row"><span>টেক প্রফিট (%):</span><input class="mono" id="tp" type="number" step="0.01" value="0.5"></div>
-        <button class="btn btn-save" onclick="saveCurrentConfig()">সেটিংস সেভ করুন</button>
-        
-        <div style="display:flex; gap:5px; margin-bottom:5px;">
-          <button class="btn btn-manual-buy" onclick="instantBuy()">তাৎক্ষণিক বাই টেস্ট</button>
-          <button class="btn btn-manual-sell" onclick="instantSell()">ট্রেড সেল/ক্লোজ</button>
-        </div>
-
-        <button class="btn btn-tg-test" onclick="testTelegram()">টেলিগ্রাম টেস্ট মেসেজ</button>
-        <button id="pwr-btn" class="btn btn-on" onclick="toggleCurrentMarket()">চালু করুন (BTC)</button>
-      </div>
-
-      <div class="box">
-        <div class="box-head">অ্যাকশন ও টেলিগ্রাম লগ</div>
-        <div class="log-box mono" id="logs"></div>
-      </div>
-
-      <div class="box">
-        <div class="box-head">লাইভ ট্রেড হিস্ট্রি</div>
-        <table class="hist-table mono">
-          <thead><tr><th>সময়</th><th>কয়েন</th><th>অর্ডার</th><th>PnL</th></tr></thead>
-          <tbody id="hist"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
+<div class="market-nav">
+  <div class="market-tab active" onclick="selectMarket('BTCUSDT', this)"><div class="tab-name">BTC</div><div class="tab-price mono" id="tab-price-BTCUSDT">$0.00</div><div class="tab-status" id="tab-st-BTCUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-BTCUSDT">DCA: 0/3</div></div>
+  <div class="market-tab" onclick="selectMarket('ETHUSDT', this)"><div class="tab-name">ETH</div><div class="tab-price mono" id="tab-price-ETHUSDT">$0.00</div><div class="tab-status" id="tab-st-ETHUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-ETHUSDT">DCA: 0/3</div></div>
+  <div class="market-tab" onclick="selectMarket('SOLUSDT', this)"><div class="tab-name">SOL</div><div class="tab-price mono" id="tab-price-SOLUSDT">$0.00</div><div class="tab-status" id="tab-st-SOLUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-SOLUSDT">DCA: 0/3</div></div>
+  <div class="market-tab" onclick="selectMarket('BNBUSDT', this)"><div class="tab-name">BNB</div><div class="tab-price mono" id="tab-price-BNBUSDT">$0.00</div><div class="tab-status" id="tab-st-BNBUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-BNBUSDT">DCA: 0/3</div></div>
+  <div class="market-tab" onclick="selectMarket('XRPUSDT', this)"><div class="tab-name">XRP</div><div class="tab-price mono" id="tab-price-XRPUSDT">$0.00</div><div class="tab-status" id="tab-st-XRPUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-XRPUSDT">DCA: 0/3</div></div>
+  <div class="market-tab" onclick="selectMarket('ADAUSDT', this)"><div class="tab-name">ADA</div><div class="tab-price mono" id="tab-price-ADAUSDT">$0.00</div><div class="tab-status" id="tab-st-ADAUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-ADAUSDT">DCA: 0/3</div></div>
+  <div class="market-tab" onclick="selectMarket('DOGEUSDT', this)"><div class="tab-name">DOGE</div><div class="tab-price mono" id="tab-price-DOGEUSDT">$0.00</div><div class="tab-status" id="tab-st-DOGEUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-DOGEUSDT">DCA: 0/3</div></div>
+  <div class="market-tab" onclick="selectMarket('AVAXUSDT', this)"><div class="tab-name">AVAX</div><div class="tab-price mono" id="tab-price-AVAXUSDT">$0.00</div><div class="tab-status" id="tab-st-AVAXUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-AVAXUSDT">DCA: 0/3</div></div>
 </div>
 
-<div id="view-pnl" class="view-section">
-  <div class="analytics-chart-box">
-    <div class="box-head">
-      <span style="color:var(--cyan); font-weight:800;">গত ২৪ ঘণ্টার প্রতি ঘণ্টার লাভ/ক্ষতি গ্রাফ (Hourly PnL)</span>
-      <span style="font-size:10px; color:var(--text-dim);" class="mono">রিয়েল-টাইম</span>
+<div class="main-grid">
+  <div>
+    <div class="box">
+      <div class="box-head">
+        <span>লাইভ চার্ট: <b style="color:var(--cyan);" id="chart-sym">BTCUSDT</b></span>
+        <div style="display:flex; gap:3px;">
+          <button class="chart-type-btn active" onclick="switchChartType('candlestick', this)">ক্যান্ডেল</button>
+          <button class="chart-type-btn" onclick="switchChartType('area', this)">এরিয়া</button>
+          <button class="chart-type-btn" onclick="switchChartType('line', this)">লাইন</button>
+        </div>
+      </div>
+      <div id="chart"></div>
+
+      <div class="sentiment-box">
+        <div style="display:flex; justify-content:space-between; font-size:10px;">
+          <span style="color:var(--green); font-weight:800;">ক্রেতা শক্তি: <span id="buy-pct">50%</span></span>
+          <span style="color:var(--red); font-weight:800;">বিক্রেতা শক্তি: <span id="sell-pct">50%</span></span>
+        </div>
+        <div class="bar-wrap"><div class="bar-fill" id="buy-bar" style="width: 50%;"></div></div>
+      </div>
+
+      <div class="ob-grid mono">
+        <div><b style="color:var(--green);">BIDS (বায়ার)</b><table class="ob-table" id="bids-list"></table></div>
+        <div><b style="color:var(--red);">ASKS (সেলার)</b><table class="ob-table" id="asks-list"></table></div>
+      </div>
     </div>
-    <div class="chart-container-pnl">
-      <canvas id="hourlyChartCanvas"></canvas>
+
+    <div class="radar-panel">
+      <div class="radar-canvas-box">
+        <canvas id="masterRadar" width="200" height="200"></canvas>
+        <div id="radarEventText" class="mono" style="font-size:10px; color:var(--green); margin-top:6px;">RADAR: SCANNING</div>
+      </div>
+      <div class="radar-hud-grid mono" id="hudGrid"></div>
     </div>
   </div>
 
-  <div class="analytics-chart-box" style="border-color: var(--border-pink);">
-    <div class="box-head">
-      <span style="color:var(--purple); font-weight:800;">গত ৭ দিনের দৈনিক মোট লাভ/ক্ষতি গ্রাফ (Daily PnL)</span>
-      <span style="font-size:10px; color:var(--text-dim);" class="mono">দৈনিক হিসাব</span>
-    </div>
-    <div class="chart-container-pnl">
-      <canvas id="dailyChartCanvas"></canvas>
-    </div>
-  </div>
+  <div>
+    <button class="api-vault-btn" onclick="toggleApiVault()">🔑 Binance API ভল্ট (গোপন ও এনক্রিপ্টেড)</button>
 
-  <div class="box">
-    <div class="box-head">কয়েনভিত্তিক একক পারফরম্যান্স ব্রেকডাউন</div>
-    <table class="coin-breakdown-table mono">
-      <thead><tr><th>কয়েন</th><th>ট্রেড সংখ্যা</th><th>নিট অর্জিত লাভ / ক্ষতি</th></tr></thead>
-      <tbody id="coin-stats-body"></tbody>
-    </table>
+    <div class="api-vault-modal" id="api-vault-box">
+      <input type="text" id="api-key" placeholder="API Key পেস্ট করুন" class="mono">
+      <input type="text" id="api-sec" placeholder="Secret Key পেস্ট করুন" class="mono">
+      <div style="display:flex; gap:5px; margin-bottom:5px;">
+        <button class="btn btn-save" style="margin:0;" onclick="saveApiKeys()">সংরক্ষণ করুন</button>
+      </div>
+    </div>
+
+    <div class="box">
+      <div class="box-head">
+        <span id="cfg-sym">BTCUSDT</span>
+        <span id="active-pnl-label" class="mono" style="font-size:10px; color:var(--text-dim);">ওপেন ট্রেড: নাই</span>
+      </div>
+
+      <div class="toggle-switch-row">
+        <span style="color:var(--green); font-weight:bold;">🛡️ নো-লস মোড:</span>
+        <label class="switch">
+          <input type="checkbox" id="no-loss-chk" checked onchange="toggleNoLoss(this.checked)">
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row"><span>ট্রেড সাইজ ($):</span><input class="mono" id="amt" type="number" value="10"></div>
+      <div class="row"><span>স্টপ লস (%):</span><input class="mono" id="sl" type="number" step="0.01" value="50.0"></div>
+      <div class="row"><span>টেক প্রফিট (%):</span><input class="mono" id="tp" type="number" step="0.01" value="0.5"></div>
+      <button class="btn btn-save" onclick="saveCurrentConfig()">সেটিংস সেভ করুন</button>
+      
+      <div style="display:flex; gap:5px; margin-bottom:5px;">
+        <button class="btn btn-manual-buy" onclick="instantBuy()">বাই টেস্ট</button>
+        <button class="btn btn-manual-sell" onclick="instantSell()">সেল / ক্লোজ</button>
+      </div>
+      <button id="pwr-btn" class="btn btn-on" onclick="toggleCurrentMarket()">চালু করুন (BTC)</button>
+    </div>
+
+    <div class="box">
+      <div class="box-head">অ্যাকশন ও এরর লগ</div>
+      <div class="log-box mono" id="logs"></div>
+    </div>
+
+    <div class="box">
+      <div class="box-head">লাইভ ট্রেড হিস্ট্রি</div>
+      <table class="hist-table mono">
+        <thead><tr><th>সময়</th><th>কয়েন</th><th>অর্ডার</th><th>PnL</th></tr></thead>
+        <tbody id="hist"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
 <script>
 let activeSymbol = "BTCUSDT";
-let userEditing = false;
 let curChartType = "candlestick";
 let chartDataCache = [];
-let isLiveTrading = false;
+let chartEl = document.getElementById('chart');
 
 function applyTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
-  const colors = { cyberpunk: '#03000a', binance: '#121418', tokyo: '#131224', matrix: '#020b05', oled: '#000000' };
-  ch.applyOptions({ layout: { background: { color: colors[t] || '#03000a' } } });
-}
-
-function switchPage(page) {
-  document.getElementById('view-trade').classList.remove('active');
-  document.getElementById('view-pnl').classList.remove('active');
-  document.getElementById('tab-btn-trade').classList.remove('active');
-  document.getElementById('tab-btn-pnl').classList.remove('active');
-
-  if(page === 'trade') {
-    document.getElementById('view-trade').classList.add('active');
-    document.getElementById('tab-btn-trade').classList.add('active');
-  } else {
-    document.getElementById('view-pnl').classList.add('active');
-    document.getElementById('tab-btn-pnl').classList.add('active');
-    setTimeout(() => {
-      if(hourlyChartInstance) hourlyChartInstance.resize();
-      if(dailyChartInstance) dailyChartInstance.resize();
-    }, 100);
-  }
-}
-
-window.addEventListener('load', () => {
-  const savedPic = localStorage.getItem('user_terminal_avatar');
-  if(savedPic) document.getElementById('user-avatar').src = savedPic;
-  const k = localStorage.getItem('saved_binance_key');
-  const s = localStorage.getItem('saved_binance_sec');
-  if(k) document.getElementById('api-key').value = k;
-  if(s) document.getElementById('api-sec').value = s;
-});
-
-function saveProfilePic(e) {
-  const file = e.target.files[0];
-  if(file) {
-    const reader = new FileReader();
-    reader.onload = function(evt) {
-      document.getElementById('user-avatar').src = evt.target.result;
-      localStorage.setItem('user_terminal_avatar', evt.target.result);
-    };
-    reader.readAsDataURL(file);
-  }
 }
 
 function toggleApiVault() {
@@ -823,20 +744,11 @@ function toggleApiVault() {
   f.style.display = (f.style.display === 'block') ? 'none' : 'block';
 }
 
-function toggleSecretVisibility() {
-  const k = document.getElementById('api-key');
-  const s = document.getElementById('api-sec');
-  const t = k.type === 'password' ? 'text' : 'password';
-  k.type = t;
-  s.type = t;
-}
-
 function toggleTradingMode() {
   fetch('/api/toggle_mode', {method:'POST'}).then(r=>r.json()).then(d=>{
-    isLiveTrading = d.live_mode;
     const b = document.getElementById('mode-toggle');
-    b.className = isLiveTrading ? "mode-badge mode-live" : "mode-badge mode-demo";
-    b.innerText = isLiveTrading ? "LIVE TRADING" : "DEMO MODE";
+    b.className = d.live_mode ? "mode-badge mode-live" : "mode-badge mode-demo";
+    b.innerText = d.live_mode ? "LIVE TRADING" : "DEMO MODE";
   });
 }
 
@@ -844,8 +756,6 @@ function saveApiKeys() {
   const k = document.getElementById('api-key').value.trim();
   const s = document.getElementById('api-sec').value.trim();
   if(!k || !s) { alert('API Key ও Secret পূরণ করুন!'); return; }
-  localStorage.setItem('saved_binance_key', k);
-  localStorage.setItem('saved_binance_sec', s);
   fetch('/api/save_keys', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -853,17 +763,6 @@ function saveApiKeys() {
   }).then(r=>r.json()).then(d=>{
     alert('API Key সফলভাবে সেভ হয়েছে!');
     document.getElementById('api-vault-box').style.display = 'none';
-  });
-}
-
-function clearApiKeys() {
-  if(!confirm("আপনি কি নিশ্চিতভাবে API Key মুছে ফেলতে চান?")) return;
-  localStorage.removeItem('saved_binance_key');
-  localStorage.removeItem('saved_binance_sec');
-  document.getElementById('api-key').value = '';
-  document.getElementById('api-sec').value = '';
-  fetch('/api/delete_keys', {method:'POST'}).then(r=>r.json()).then(d=>{
-    alert('API Key মুছে ফেলা হয়েছে!');
   });
 }
 
@@ -885,11 +784,9 @@ function updateActiveControls() {
       b.className = m.running ? "btn btn-off" : "btn btn-on";
       b.innerText = m.running ? "বন্ধ করুন (" + activeSymbol.replace('USDT','') + ")" : "চালু করুন (" + activeSymbol.replace('USDT','') + ")";
       document.getElementById('no-loss-chk').checked = !!m.no_loss_mode;
-      if(!userEditing) {
-        document.getElementById('amt').value = m.amount;
-        document.getElementById('sl').value = m.stop_loss;
-        document.getElementById('tp').value = m.take_profit;
-      }
+      document.getElementById('amt').value = m.amount;
+      document.getElementById('sl').value = m.stop_loss;
+      document.getElementById('tp').value = m.take_profit;
     }
   });
 }
@@ -898,20 +795,16 @@ function toggleNoLoss(val) {
   fetch('/api/toggle_no_loss?symbol=' + encodeURIComponent(activeSymbol) + '&val=' + val, {method:'POST'});
 }
 
-['amt', 'sl', 'tp', 'api-key', 'api-sec'].forEach(id => {
-  const el = document.getElementById(id);
-  if(el) {
-    el.addEventListener('focus', () => { userEditing = true; });
-    el.addEventListener('blur', () => { userEditing = false; });
-  }
-});
-
-const ch = LightweightCharts.createChart(document.getElementById('chart'), {
+const ch = LightweightCharts.createChart(chartEl, {
   layout: { background: { color: 'transparent' }, textColor: '#a1a1aa', fontSize: 10 },
   grid: { vertLines: { color: 'rgba(255,0,119,0.08)' }, horzLines: { color: 'rgba(0,240,255,0.08)' } },
   timeScale: { timeVisible: true, rightOffset: 5 }
 });
 let series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
+
+window.addEventListener('resize', () => {
+  ch.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
+});
 
 function switchChartType(type, btn) {
   document.querySelectorAll('.chart-type-btn').forEach(b => b.classList.remove('active'));
@@ -928,9 +821,6 @@ function switchChartType(type, btn) {
   } else if (type === 'line') {
     series = ch.addLineSeries({ color: '#00f0ff', lineWidth: 2 });
     series.setData(chartDataCache.map(k => ({ time: k.time, value: k.close })));
-  } else if (type === 'bar') {
-    series = ch.addBarSeries({ upColor: '#00ff66', downColor: '#ff0044' });
-    series.setData(chartDataCache);
   }
 }
 
@@ -938,13 +828,12 @@ function loadChartData(sym) {
   fetch('/api/klines?symbol=' + sym)
     .then(r => r.json())
     .then(d => {
-      chartDataCache = d;
-      if (curChartType === 'candlestick' || curChartType === 'bar') {
-        series.setData(d);
-      } else {
-        series.setData(d.map(k => ({ time: k.time, value: k.close })));
+      if(d && d.length > 0) {
+        chartDataCache = d;
+        if (curChartType === 'candlestick') series.setData(d);
+        else series.setData(d.map(k => ({ time: k.time, value: k.close })));
+        ch.timeScale().fitContent();
       }
-      ch.timeScale().fitContent();
     }).catch(e=>{});
 }
 loadChartData("BTCUSDT");
@@ -954,30 +843,15 @@ function toggleCurrentMarket() {
     const b = document.getElementById('pwr-btn');
     b.className = d.running ? "btn btn-off" : "btn btn-on";
     b.innerText = d.running ? "বন্ধ করুন (" + activeSymbol.replace('USDT','') + ")" : "চালু করুন (" + activeSymbol.replace('USDT','') + ")";
-    const sEl = document.getElementById('tab-st-' + activeSymbol);
-    if(sEl) {
-      sEl.innerText = d.running ? "ACTIVE" : "OFF";
-      sEl.style.color = d.running ? "var(--green)" : "var(--text-dim)";
-    }
   });
 }
 
 function instantBuy() {
-  fetch('/api/instant_buy?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}).then(r=>r.json()).then(()=>{
-    alert(activeSymbol + ' এ বাই কার্যকর!');
-  });
+  fetch('/api/instant_buy?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'});
 }
 
 function instantSell() {
-  fetch('/api/instant_sell?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}).then(r=>r.json()).then(()=>{
-    alert(activeSymbol + ' ট্রেড সেল/ক্লোজ হয়েছে!');
-  });
-}
-
-function testTelegram() {
-  fetch('/api/test_tg', {method:'POST'}).then(r=>r.json()).then(()=>{
-    alert('টেলিগ্রামে টেস্ট বার্তা পাঠানো হয়েছে!');
-  });
+  fetch('/api/instant_sell?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'});
 }
 
 function saveCurrentConfig() {
@@ -992,67 +866,8 @@ function saveCurrentConfig() {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify(p)
-  }).then(()=>{ alert(activeSymbol + ' এর সেটিংস সেভ হয়েছে!'); });
+  }).then(()=>{ alert(activeSymbol + ' সেটিংস সেভ হয়েছে!'); });
 }
-
-let hourlyChartInstance = null;
-let dailyChartInstance = null;
-
-function initPnlCharts() {
-  const ctxH = document.getElementById('hourlyChartCanvas').getContext('2d');
-  hourlyChartInstance = new Chart(ctxH, {
-    type: 'bar',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'Hourly PnL ($)',
-        data: [],
-        backgroundColor: 'rgba(0, 240, 255, 0.45)',
-        borderColor: '#00f0ff',
-        borderWidth: 2,
-        borderRadius: 4
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {
-        x: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } }
-      },
-      plugins: { legend: { display: false } }
-    }
-  });
-
-  const ctxD = document.getElementById('dailyChartCanvas').getContext('2d');
-  dailyChartInstance = new Chart(ctxD, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'Daily PnL ($)',
-        data: [],
-        borderColor: '#ff0077',
-        backgroundColor: 'rgba(255, 0, 119, 0.2)',
-        fill: true,
-        tension: 0.35,
-        borderWidth: 2.5,
-        pointBackgroundColor: '#00f0ff',
-        pointRadius: 4
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {
-        x: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } }
-      },
-      plugins: { legend: { display: false } }
-    }
-  });
-}
-initPnlCharts();
 
 const rCvs = document.getElementById('masterRadar');
 const rCtx = rCvs.getContext('2d');
@@ -1060,8 +875,8 @@ let rAngle = 0;
 let radarBlips = [];
 
 function drawMasterRadar() {
-  rCtx.clearRect(0,0,220,220);
-  const cx = 110, cy = 110, r = 96;
+  rCtx.clearRect(0,0,200,200);
+  const cx = 100, cy = 100, r = 85;
 
   rCtx.strokeStyle = 'rgba(0, 240, 255, 0.4)';
   rCtx.lineWidth = 1;
@@ -1070,12 +885,6 @@ function drawMasterRadar() {
     rCtx.arc(cx, cy, (r/3)*i, 0, Math.PI*2);
     rCtx.stroke();
   }
-
-  rCtx.beginPath();
-  rCtx.moveTo(cx, cy - r); rCtx.lineTo(cx, cy + r);
-  rCtx.moveTo(cx - r, cy); rCtx.lineTo(cx + r, cy);
-  rCtx.strokeStyle = 'rgba(255, 0, 119, 0.3)';
-  rCtx.stroke();
 
   rCtx.save();
   rCtx.translate(cx, cy);
@@ -1091,13 +900,10 @@ function drawMasterRadar() {
     rCtx.beginPath();
     rCtx.arc(b.x, b.y, b.size, 0, Math.PI*2);
     rCtx.fillStyle = b.color;
-    rCtx.shadowColor = b.color;
-    rCtx.shadowBlur = 8;
     rCtx.fill();
-    rCtx.shadowBlur = 0;
     rCtx.fillStyle = '#fff';
     rCtx.font = '8px "JetBrains Mono"';
-    rCtx.fillText(b.name, b.x + 5, b.y + 3);
+    rCtx.fillText(b.name, b.x + 4, b.y + 3);
   });
 
   rAngle += 0.04;
@@ -1107,12 +913,11 @@ drawMasterRadar();
 
 setInterval(()=>{
   fetch('/api/status').then(r=>r.json()).then(d=>{
-    isLiveTrading = d.live_mode;
     const b = document.getElementById('mode-toggle');
-    b.className = isLiveTrading ? "mode-badge mode-live" : "mode-badge mode-demo";
-    b.innerText = isLiveTrading ? "LIVE TRADING" : "DEMO MODE";
+    b.className = d.live_mode ? "mode-badge mode-live" : "mode-badge mode-demo";
+    b.innerText = d.live_mode ? "LIVE TRADING" : "DEMO MODE";
 
-    const curBal = isLiveTrading ? d.live_balance : d.demo_balance;
+    const curBal = d.live_mode ? d.live_balance : d.demo_balance;
     document.getElementById('v-bal').innerText = '$' + curBal.toFixed(2);
     
     const pnl = d.realized_pnl;
@@ -1120,18 +925,10 @@ setInterval(()=>{
     allEl.innerText = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
     allEl.style.color = pnl >= 0 ? "var(--green)" : "var(--red)";
 
-    const p1El = document.getElementById('v-1h-pnl');
-    p1El.innerText = (d.pnl_1h >= 0 ? '+$' : '-$') + Math.abs(d.pnl_1h).toFixed(2);
-    p1El.style.color = d.pnl_1h >= 0 ? "var(--green)" : "var(--red)";
-    document.getElementById('v-1h-tr').innerText = d.trades_1h + "টি ট্রেড";
-
-    const p24El = document.getElementById('v-24h-pnl');
-    p24El.innerText = (d.pnl_24h >= 0 ? '+$' : '-$') + Math.abs(d.pnl_24h).toFixed(2);
-    p24El.style.color = d.pnl_24h >= 0 ? "var(--green)" : "var(--red)";
-    document.getElementById('v-24h-tr').innerText = d.trades_24h + "টি ট্রেড";
-
-    document.getElementById('v-tot-buy').innerText = d.total_buys + " BUY";
-    document.getElementById('v-tot-sell').innerText = d.total_sells + " SELL";
+    document.getElementById('v-1h-pnl').innerText = (d.pnl_1h >= 0 ? '+$' : '-$') + Math.abs(d.pnl_1h).toFixed(2);
+    document.getElementById('v-24h-pnl').innerText = (d.pnl_24h >= 0 ? '+$' : '-$') + Math.abs(d.pnl_24h).toFixed(2);
+    document.getElementById('v-tot-buy').innerText = d.total_buys;
+    document.getElementById('v-tot-sell').innerText = d.total_sells;
 
     const winRate = d.total_sells > 0 ? ((d.wins / d.total_sells) * 100).toFixed(1) : "0";
     document.getElementById('v-winrate').innerText = winRate + '%';
@@ -1157,16 +954,16 @@ setInterval(()=>{
       if(dcaEl) dcaEl.innerText = 'DCA: ' + ords.length + '/3';
 
       const a = (idx / symList.length) * Math.PI * 2;
-      const dist = 32 + (idx % 3) * 26;
+      const dist = 28 + (idx % 3) * 22;
       newBlips.push({
-        x: 110 + Math.cos(a) * dist,
-        y: 110 + Math.sin(a) * dist,
+        x: 100 + Math.cos(a) * dist,
+        y: 100 + Math.sin(a) * dist,
         size: inTrade ? 4.5 : 3,
         color: inTrade ? '#00ff66' : '#00f0ff',
         name: sym.replace('USDT','')
       });
 
-      hudHtml += `<div class="hud-coin-card ${inTrade ? 'buy-pulse' : ''}">
+      hudHtml += `<div class="hud-coin-card">
         <div style="font-size:10px; font-weight:800; color:var(--cyan);">${sym.replace('USDT','')}</div>
         <div style="font-size:10px; color:#fff; margin:2px 0;">$${m.price < 1 ? m.price.toFixed(4) : m.price.toFixed(2)}</div>
         <div style="font-size:8px; color:${inTrade ? 'var(--green)' : 'var(--text-dim)'};">${inTrade ? 'DCA ('+ords.length+'/3)' : 'STANDBY'}</div>
@@ -1175,10 +972,6 @@ setInterval(()=>{
 
     radarBlips = newBlips;
     document.getElementById('hudGrid').innerHTML = hudHtml;
-
-    if (d.last_radar_event && (Date.now()/1000 - d.last_radar_event.time < 4)) {
-      document.getElementById('radarEventText').innerHTML = `TARGET: <b style="color:${d.last_radar_event.type==='BUY'?'var(--green)':'var(--red)'}">${d.last_radar_event.type} ${d.last_radar_event.symbol}</b>`;
-    }
 
     const cur = d.markets[activeSymbol];
     if(cur) {
@@ -1197,13 +990,9 @@ setInterval(()=>{
         pTag.style.color = "var(--text-dim)";
       }
 
-      const pwr = document.getElementById('pwr-btn');
-      pwr.className = cur.running ? "btn btn-off" : "btn btn-on";
-      pwr.innerText = cur.running ? "বন্ধ করুন (" + activeSymbol.replace('USDT','') + ")" : "চালু করুন (" + activeSymbol.replace('USDT','') + ")";
-
       if(cur.price > 0) {
         const tick = {time: Math.floor(Date.now()/1000), open: cur.price, high: cur.price, low: cur.price, close: cur.price};
-        if(curChartType === 'candlestick' || curChartType === 'bar') series.update(tick);
+        if(curChartType === 'candlestick') series.update(tick);
         else series.update({time: tick.time, value: cur.price});
       }
 
@@ -1213,32 +1002,6 @@ setInterval(()=>{
 
     document.getElementById('logs').innerHTML = d.logs.map(l=>`<div>${l}</div>`).join('');
     document.getElementById('hist').innerHTML = d.history.map(h=>`<tr><td>${h.time}</td><td style="color:var(--cyan);font-weight:bold">${h.symbol.replace('USDT','')}</td><td style="color:${h.side.includes('BUY')?'var(--green)':'var(--red)'}">${h.side}</td><td>${h.pnl}%</td></tr>`).join('');
-
-    const an = d.analytics;
-    if(an) {
-      let coinRows = '';
-      for (const [sym, cst] of Object.entries(an.coin_stats)) {
-        const col = cst.profit >= 0 ? 'var(--green)' : 'var(--red)';
-        const sign = cst.profit >= 0 ? '+$' : '-$';
-        coinRows += `<tr>
-          <td style="color:var(--cyan); font-weight:bold;">${sym.replace('USDT','')}</td>
-          <td>${cst.trades}টি</td>
-          <td style="color:${col}; font-weight:bold;">${sign}${Math.abs(cst.profit).toFixed(2)}</td>
-        </tr>`;
-      }
-      document.getElementById('coin-stats-body').innerHTML = coinRows;
-
-      if(hourlyChartInstance && an.hourly_chart && an.hourly_chart.labels.length > 0) {
-        hourlyChartInstance.data.labels = an.hourly_chart.labels;
-        hourlyChartInstance.data.datasets[0].data = an.hourly_chart.data;
-        hourlyChartInstance.update('none');
-      }
-      if(dailyChartInstance && an.daily_chart && an.daily_chart.labels.length > 0) {
-        dailyChartInstance.data.labels = an.daily_chart.labels;
-        dailyChartInstance.data.datasets[0].data = an.daily_chart.data;
-        dailyChartInstance.update('none');
-      }
-    }
   });
 }, 1500);
 </script>
@@ -1306,18 +1069,9 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     m["position"] = {"buy_price": p, "amount": amt}
                     m["unrealized_pnl"] = 0.0
                     bot["total_buys"] += 1
-                    bot["last_radar_event"] = {"symbol": sym, "type": "BUY", "time": time.time()}
                     save_state()
                     add_log(f"[{sym}] ম্যানুয়াল বাই @ ${p:.2f}")
-                    send_telegram(f"⚡ *[MANUAL BUY]* {sym}\nPrice: `${p:.4f}`\nAmount: `${m['amount']}`")
                     log_trade_db(sym, "BUY", p, 0.0, 0.0, "Manual Test")
-                    bot["history"].appendleft({
-                        "time": time.strftime("%H:%M:%S"),
-                        "symbol": sym,
-                        "side": "BUY",
-                        "price": round(p, 4),
-                        "pnl": 0.0
-                    })
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1344,26 +1098,11 @@ class CompleteRouter(BaseHTTPRequestHandler):
                         bot["pnl_1h"] += profit
                         bot["pnl_24h"] += profit
                         bot["total_sells"] += 1
-                        bot["trades_1h"] += 1
-                        bot["trades_24h"] += 1
-                        if profit > 0:
-                            bot["wins"] += 1
                         save_state()
-
-                        bot["last_radar_event"] = {"symbol": sym, "type": "SELL", "time": time.time()}
-                        add_log(f"[{sym}] ম্যানুয়াল ক্লোজ ({len(orders)}x DCA): {profit:+.2f}$ ({diff:+.2f}%)")
-                        send_telegram(f"🏁 *[MANUAL CLOSE]* {sym}\nPrice: `${p:.4f}`\nPnL: `{diff:+.2f}%` (`{profit:+.2f}$`)")
+                        add_log(f"[{sym}] ম্যানুয়াল ক্লোজ: {profit:+.2f}$")
                         log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Close")
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": sym,
-                            "side": "SELL",
-                            "price": round(p, 4),
-                            "pnl": round(diff, 2)
-                        })
                         m["dca_orders"] = []
                         m["position"] = None
-                        m["unrealized_pnl"] = 0.0
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1380,8 +1119,6 @@ class CompleteRouter(BaseHTTPRequestHandler):
             with lock:
                 if sym in bot["markets"]:
                     bot["markets"][sym]["no_loss_mode"] = val
-                    st_str = "অন" if val else "অফ"
-                    add_log(f"[{sym}] নো-লস মোড {st_str}")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1399,14 +1136,6 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
 
-        elif self.path == '/api/delete_keys':
-            delete_config()
-            add_log("API Key ভল্ট থেকে মুছে ফেলা হয়েছে")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
-
         elif self.path == '/api/toggle_mode':
             with lock:
                 bot["live_mode"] = not bot["live_mode"]
@@ -1417,13 +1146,6 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(res).encode('utf-8'))
-
-        elif self.path == '/api/test_tg':
-            send_telegram("🔔 [TEST MESSAGE] Telegram Connection Verified Successfully.")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
 
         elif self.path.startswith('/api/toggle'):
             query = self.path.split('?')
@@ -1455,7 +1177,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     m["take_profit"] = float(data.get("take_profit", m["take_profit"]))
                     if "no_loss_mode" in data:
                         m["no_loss_mode"] = bool(data["no_loss_mode"])
-                    add_log(f"[{sym}] সেটিংস সংরক্ষিত: TP={m['take_profit']}%, SL={m['stop_loss']}%")
+                    add_log(f"[{sym}] সেটিংস সংরক্ষিত")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1465,10 +1187,9 @@ class CompleteRouter(BaseHTTPRequestHandler):
         return
 
 def run_server():
-    print(f"\n==========================================")
-    print(f"Cyberpunk Ultra Terminal Starting on port {PORT}...")
-    print(f"==========================================\n")
-    srv = ReusableThreadingServer((HOST, PORT), CompleteRouter)
+    server_port = int(os.environ.get("PORT", 8080))
+    print(f"\nTerminal Listening on 0.0.0.0:{server_port}\n", flush=True)
+    srv = ReusableThreadingServer(("0.0.0.0", server_port), CompleteRouter)
     srv.serve_forever()
 
 if __name__ == "__main__":
