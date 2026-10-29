@@ -1,1476 +1,928 @@
 #!/usr/bin/env python3
-import json
-import time
+# Crypto Bot Pro — Binance Spot + Telegram Dashboard
+
 import os
+import time
 import hmac
 import hashlib
-import threading
 import sqlite3
-import urllib.request
-import urllib.parse
-from datetime import datetime, timedelta
-from collections import deque
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
+import logging
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone
+from urllib.parse import urlencode
 
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 8080))
+import requests
+from flask import Flask, jsonify, request, render_template_string
 
-CONFIG_FILE = "config.json"
+APP = Flask(__name__)
+
+# Binance API
 BINANCE_API_KEY = "0QzotPVZt9eAbkMSuPpDSe0OQXwbQqsYM59o7HmrDHlu46ClaAemMNlnDTIXrNke"
 BINANCE_API_SECRET = "qvhNafkMmHSgsFuOX4bPafqk45bDU1x8HUcasCSDFPBgMd9msH4uoTv2X6CjhQNb"
 
-def load_config():
-    global BINANCE_API_KEY, BINANCE_API_SECRET
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                data = json.load(f)
-                if data.get("key"): BINANCE_API_KEY = data.get("key", "").strip()
-                if data.get("secret"): BINANCE_API_SECRET = data.get("secret", "").strip()
-        except Exception:
-            pass
-
-def save_config(key, secret):
-    global BINANCE_API_KEY, BINANCE_API_SECRET
-    BINANCE_API_KEY = key.strip()
-    BINANCE_API_SECRET = secret.strip()
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump({"key": BINANCE_API_KEY, "secret": BINANCE_API_SECRET}, f)
-    except Exception:
-        pass
-
-def delete_config():
-    global BINANCE_API_KEY, BINANCE_API_SECRET
-    BINANCE_API_KEY = ""
-    BINANCE_API_SECRET = ""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            os.remove(CONFIG_FILE)
-        except Exception:
-            pass
-
-load_config()
-
-TELEGRAM_TOKEN = "9089337002:AAFDg1eJBFuQzvEkN5FD1gVh8zk1J1WhZdo"
+# Telegram API
+TELEGRAM_BOT_TOKEN = "9089337002:AAFDg1eJBFuQzvEkN5FD1gVh8zk1J1WhZdo"
 TELEGRAM_CHAT_ID = "7741119923"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"]
-MAX_OPEN_POSITIONS = 5
-STATE_FILE = "bot_state.json"
-DB_FILE = "trading_history.db"
+DB = "trades.db"
+HOST = "127.0.0.1"
+PORT = int(os.getenv("PORT", "5000"))
+BASE = "https://api.binance.com"
 
-def load_state():
-    default_state = {
-        "demo_balance": 1000.0,
-        "total_buys": 0,
-        "total_sells": 0,
-        "wins": 0,
-        "realized_pnl": 0.0,
-        "pnl_1h": 0.0,
-        "pnl_24h": 0.0,
-        "trades_1h": 0,
-        "trades_24h": 0
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+    "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"
+]
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("CryptoBot")
+lock = threading.RLock()
+trade_lock = threading.Lock()
+
+state = {
+    "running": False,
+    "live": False,
+    "strategy": False,
+    "no_loss": True,
+    "trade_usdt": 10.0,
+    "sl": 1.5,
+    "tp": 2.0,
+    "maxpos": 3,
+    "poll": 15,
+    "error": "",
+    "updated": "",
+    "symbols": {
+        s: {"enabled": False, "price": 0.0, "status": "Paused"}
+        for s in SYMBOLS
     }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-                default_state.update(data)
-        except Exception:
-            pass
-    return default_state
+}
 
-def save_state():
-    try:
-        data = {
-            "demo_balance": bot["demo_balance"],
-            "total_buys": bot["total_buys"],
-            "total_sells": bot["total_sells"],
-            "wins": bot["wins"],
-            "realized_pnl": bot["realized_pnl"],
-            "pnl_1h": bot["pnl_1h"],
-            "pnl_24h": bot["pnl_24h"],
-            "trades_1h": bot["trades_1h"],
-            "trades_24h": bot["trades_24h"]
-        }
-        with open(STATE_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+last_prices = {}
+last_buy_time = {}
+exchange_filters = {}
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def db():
+    c = sqlite3.connect(DB, timeout=20, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
+
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT,
-        symbol TEXT,
-        side TEXT,
-        price REAL,
-        pnl REAL,
-        profit_usd REAL,
-        reason TEXT
-    )''')
-    conn.commit()
-    conn.close()
+    with db() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                symbol TEXT PRIMARY KEY,
+                qty TEXT NOT NULL,
+                entry TEXT NOT NULL,
+                spent TEXT NOT NULL,
+                opened TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                order_id TEXT,
+                stop TEXT,
+                take TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT,
+                symbol TEXT,
+                side TEXT,
+                price TEXT,
+                qty TEXT,
+                quote TEXT,
+                pnl TEXT,
+                reason TEXT,
+                mode TEXT,
+                order_id TEXT
+            )
+        """)
 
-def log_trade_db(symbol, side, price, pnl, profit_usd, reason):
+
+def positions():
+    with db() as c:
+        return [
+            dict(r) for r in
+            c.execute("SELECT * FROM positions ORDER BY opened DESC").fetchall()
+        ]
+
+
+def history():
+    with db() as c:
+        return [
+            dict(r) for r in
+            c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 100").fetchall()
+        ]
+
+
+def get_position(symbol):
+    with db() as c:
+        r = c.execute(
+            "SELECT * FROM positions WHERE symbol=?", (symbol,)
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def save_position(symbol, qty, entry, spent, mode, order_id=""):
+    stop = float(entry) * (1 - float(state["sl"]) / 100)
+    take = float(entry) * (1 + float(state["tp"]) / 100)
+
+    with db() as c:
+        c.execute("""
+            INSERT OR REPLACE INTO positions
+            (symbol, qty, entry, spent, opened, mode, order_id, stop, take)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            symbol, str(qty), str(entry), str(spent), utcnow(),
+            mode, str(order_id), str(stop), str(take)
+        ))
+
+
+def remove_position(symbol):
+    with db() as c:
+        c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+
+
+def log_trade(symbol, side, price, qty, quote, pnl, reason, mode, order_id=""):
+    with db() as c:
+        c.execute("""
+            INSERT INTO trades
+            (time, symbol, side, price, qty, quote, pnl, reason, mode, order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            utcnow(), symbol, side, str(price), str(qty), str(quote),
+            str(pnl), reason, mode, str(order_id)
+        ))
+
+
+def telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('''INSERT INTO trades (timestamp, symbol, side, price, pnl, profit_usd, reason)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, side, price, pnl, profit_usd, reason))
-        conn.commit()
-        conn.close()
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message[:3900]
+            },
+            timeout=10
+        )
+        return r.ok and r.json().get("ok", False)
     except Exception:
-        pass
+        log.exception("Telegram send failed")
+        return False
 
-init_db()
 
-def load_initial_history():
-    hist = deque(maxlen=40)
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT timestamp, symbol, side, price, pnl FROM trades ORDER BY id DESC LIMIT 20")
-        for r in c.fetchall():
-            hist.append({
-                "time": r[0].split()[1] if ' ' in r[0] else r[0],
-                "symbol": r[1],
-                "side": r[2],
-                "price": r[3],
-                "pnl": r[4]
-            })
-        conn.close()
-    except Exception:
-        pass
-    return hist
+class Binance:
+    def __init__(self):
+        self.key = BINANCE_API_KEY.strip()
+        self.secret = BINANCE_API_SECRET.strip()
+        self.session = requests.Session()
 
-time_offset = 0
+        if self.key:
+            self.session.headers.update({"X-MBX-APIKEY": self.key})
 
-def sync_binance_time():
-    global time_offset
-    try:
-        req = urllib.request.Request("https://api.binance.com/api/v3/time", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            data = json.loads(resp.read().decode())
-            server_time = data["serverTime"]
-            local_time = int(time.time() * 1000)
-            time_offset = server_time - local_time
-    except Exception:
-        pass
+    def public(self, path, params=None):
+        r = self.session.get(
+            BASE + path,
+            params=params or {},
+            timeout=15
+        )
+        r.raise_for_status()
+        return r.json()
 
-sync_binance_time()
+    def signed(self, method, path, params=None):
+        if not self.key or not self.secret:
+            raise RuntimeError("Binance API Key/Secret সেট করা নেই")
 
-def binance_signed_request(endpoint, method="GET", params=None):
-    global BINANCE_API_KEY, BINANCE_API_SECRET, time_offset
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key অথবা Secret খালি!"
-    try:
-        if params is None:
-            params = {}
-        sync_binance_time()
-        params["timestamp"] = int(time.time() * 1000) + time_offset
-        params["recvWindow"] = 60000
-        query_string = urllib.parse.urlencode(params)
-        signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-        full_url = f"https://api.binance.com{endpoint}?{query_string}&signature={signature}"
-        req = urllib.request.Request(full_url, method=method)
-        req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            return json.loads(resp.read().decode()), None
-    except urllib.error.HTTPError as e:
-        try:
-            err_data = json.loads(e.read().decode())
-            return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
-        except Exception:
-            return None, f"HTTP Error {e.code}"
-    except Exception as ex:
-        return None, str(ex)
+        p = dict(params or {})
+        p["timestamp"] = int(time.time() * 1000)
+        p["recvWindow"] = 5000
 
-def get_live_balance():
-    res, err = binance_signed_request("/api/v3/account", method="GET")
-    if err:
-        return 0.0, err
-    if res and "balances" in res:
-        for b in res["balances"]:
-            if b["asset"] == "USDT":
-                return float(b["free"]), None
-    return 0.0, "USDT Asset পাওয়া যায়নি"
+        query = urlencode(p)
+        signature = hmac.new(
+            self.secret.encode(),
+            query.encode(),
+            hashlib.sha256
+        ).hexdigest()
 
-def get_analytics_metrics():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        coin_stats = {}
-        for sym in SYMBOLS:
-            c.execute("SELECT COUNT(*), COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE symbol=? AND side='SELL'", (sym,))
-            cr = c.fetchone()
-            coin_stats[sym] = {"trades": cr[0] or 0, "profit": round(cr[1] or 0.0, 3)}
+        url = BASE + path + "?" + query + "&signature=" + signature
+        r = self.session.request(method, url, timeout=20)
 
-        now = datetime.now()
-        hourly_labels = []
-        hourly_values = []
-        for i in range(23, -1, -1):
-            h_start = (now - timedelta(hours=i+1)).strftime("%Y-%m-%d %H:%M:%S")
-            h_end = (now - timedelta(hours=i)).strftime("%Y-%m-%d %H:%M:%S")
-            c.execute("SELECT COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE side='SELL' AND timestamp >= ? AND timestamp < ?", (h_start, h_end))
-            val = round(c.fetchone()[0] or 0.0, 3)
-            hourly_labels.append((now - timedelta(hours=i)).strftime("%H:00"))
-            hourly_values.append(val)
+        if not r.ok:
+            try:
+                message = r.json().get("msg", r.text)
+            except Exception:
+                message = r.text
+            raise RuntimeError("Binance API error: " + str(message)[:250])
 
-        daily_labels = []
-        daily_values = []
-        for i in range(6, -1, -1):
-            d_start = (now - timedelta(days=i+1)).strftime("%Y-%m-%d 00:00:00")
-            d_end = (now - timedelta(days=i)).strftime("%Y-%m-%d 23:59:59")
-            c.execute("SELECT COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE side='SELL' AND timestamp >= ? AND timestamp <= ?", (d_start, d_end))
-            val = round(c.fetchone()[0] or 0.0, 3)
-            daily_labels.append((now - timedelta(days=i)).strftime("%d %b"))
-            daily_values.append(val)
+        return r.json()
 
-        conn.close()
+    def price(self, symbol):
+        return float(
+            self.public(
+                "/api/v3/ticker/price",
+                {"symbol": symbol}
+            )["price"]
+        )
+
+    def account(self):
+        return self.signed("GET", "/api/v3/account")
+
+    def load_filters(self):
+        info = self.public("/api/v3/exchangeInfo")
+
+        for item in info["symbols"]:
+            if item["symbol"] not in SYMBOLS:
+                continue
+
+            fs = {f["filterType"]: f for f in item["filters"]}
+            lot = fs.get("LOT_SIZE", {})
+            notional = fs.get("NOTIONAL") or fs.get("MIN_NOTIONAL", {})
+
+            exchange_filters[item["symbol"]] = {
+                "step": lot.get("stepSize", "0.000001"),
+                "min_qty": lot.get("minQty", "0"),
+                "min_notional": notional.get("minNotional", "5")
+            }
+
+    def market_buy(self, symbol, usdt):
+        return self.signed("POST", "/api/v3/order", {
+            "symbol": symbol,
+            "side": "BUY",
+            "type": "MARKET",
+            "quoteOrderQty": f"{float(usdt):.2f}",
+            "newOrderRespType": "FULL"
+        })
+
+    def market_sell(self, symbol, qty):
+        if symbol not in exchange_filters:
+            self.load_filters()
+
+        f = exchange_filters[symbol]
+        step = Decimal(f["step"])
+        amount = Decimal(str(qty))
+
+        if step > 0:
+            amount = (
+                amount / step
+            ).to_integral_value(rounding=ROUND_DOWN) * step
+
+        if amount <= 0 or amount < Decimal(f["min_qty"]):
+            raise RuntimeError(
+                "বিক্রির quantity Binance minimum/step অনুযায়ী বৈধ নয়"
+            )
+
+        return self.signed("POST", "/api/v3/order", {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": format(amount, "f"),
+            "newOrderRespType": "FULL"
+        })
+
+
+bn = Binance()
+
+
+def order_average(order):
+    fills = order.get("fills") or []
+    qty = sum(float(f.get("qty", 0)) for f in fills)
+    quote = sum(
+        float(f.get("qty", 0)) * float(f.get("price", 0))
+        for f in fills
+    )
+
+    if qty > 0 and quote > 0:
+        return quote / qty, qty, quote
+
+    qty = float(order.get("executedQty", 0))
+    quote = float(order.get("cummulativeQuoteQty", 0))
+
+    if qty > 0 and quote > 0:
+        return quote / qty, qty, quote
+
+    raise RuntimeError("Order fill পাওয়া যায়নি")
+
+
+def paper_buy(symbol, price, usdt, reason):
+    qty = usdt / price
+    save_position(symbol, qty, price, usdt, "DEMO")
+    log_trade(symbol, "BUY", price, qty, usdt, 0, reason, "DEMO")
+
+    telegram(
+        f"🟢 DEMO BUY\n{symbol}\nPrice: {price}\nAmount: {usdt:.2f} USDT"
+    )
+
+    return {"mode": "DEMO", "qty": qty, "price": price}
+
+
+def live_buy(symbol, usdt, reason):
+    if not state["live"]:
+        raise RuntimeError("LIVE mode চালু নেই")
+
+    if symbol not in exchange_filters:
+        bn.load_filters()
+
+    f = exchange_filters[symbol]
+
+    if usdt < float(f["min_notional"]):
+        raise RuntimeError(
+            f"{symbol} minimum order প্রায় {f['min_notional']} USDT"
+        )
+
+    order = bn.market_buy(symbol, usdt)
+    avg, qty, quote = order_average(order)
+
+    save_position(
+        symbol, qty, avg, quote, "LIVE", order.get("orderId", "")
+    )
+
+    log_trade(
+        symbol, "BUY", avg, qty, quote, 0,
+        reason, "LIVE", order.get("orderId", "")
+    )
+
+    telegram(
+        f"🔴 LIVE BUY FILLED\n{symbol}\nAvg: {avg}\n"
+        f"Qty: {qty}\nSpent: {quote:.4f} USDT"
+    )
+
+    return {"mode": "LIVE", "qty": qty, "price": avg, "quote": quote}
+
+
+def buy_symbol(symbol, reason="Manual buy"):
+    if symbol not in SYMBOLS:
+        raise ValueError("অজানা symbol")
+
+    with trade_lock:
+        if get_position(symbol):
+            raise RuntimeError(f"{symbol} position আগে থেকেই আছে")
+
+        if len(positions()) >= int(state["maxpos"]):
+            raise RuntimeError("সর্বোচ্চ open position limit পূর্ণ")
+
+        if reason != "Manual buy" and not state["symbols"][symbol]["enabled"]:
+            raise RuntimeError(f"{symbol} disabled")
+
+        price = bn.price(symbol)
+        usdt = float(state["trade_usdt"])
+
+        if usdt < 5:
+            raise RuntimeError("Trade size অন্তত 5 USDT হতে হবে")
+
+        if state["live"]:
+            return live_buy(symbol, usdt, reason)
+
+        return paper_buy(symbol, price, usdt, reason)
+
+
+def sell_position(symbol, price, reason):
+    with trade_lock:
+        pos = get_position(symbol)
+
+        if not pos:
+            return {"ok": False, "error": "Position পাওয়া যায়নি"}
+
+        entry = float(pos["entry"])
+        qty = float(pos["qty"])
+        mode = pos["mode"]
+
+        if mode == "LIVE":
+            if not state["live"]:
+                return {
+                    "ok": False,
+                    "error": "LIVE বন্ধ; বিক্রির আগে LIVE চালু করো"
+                }
+
+            account = bn.account()
+            base_asset = (
+                symbol[:-4] if symbol.endswith("USDT") else symbol
+            )
+
+            free = next(
+                (
+                    float(b["free"])
+                    for b in account.get("balances", [])
+                    if b["asset"] == base_asset
+                ),
+                0.0
+            )
+
+            qty = min(qty, free)
+
+            if qty <= 0:
+                raise RuntimeError("বিক্রির জন্য free balance পাওয়া যায়নি")
+
+            order = bn.market_sell(symbol, qty)
+            avg, sold_qty, quote = order_average(order)
+            order_id = order.get("orderId", "")
+
+        else:
+            avg = price
+            sold_qty = qty
+            quote = qty * price
+            order_id = ""
+
+        pnl = (avg - entry) * sold_qty
+        pnl_pct = ((avg - entry) / entry * 100) if entry else 0
+
+        log_trade(
+            symbol, "SELL", avg, sold_qty, quote, pnl,
+            reason, mode, order_id
+        )
+
+        remove_position(symbol)
+
+        telegram(
+            f"🔻 {mode} SELL\n{symbol}\nPrice: {avg}\n"
+            f"P/L before fees: {pnl:.4f} USDT ({pnl_pct:.2f}%)\n"
+            f"Reason: {reason}"
+        )
+
         return {
-            "coin_stats": coin_stats,
-            "hourly_chart": {"labels": hourly_labels, "data": hourly_values},
-            "daily_chart": {"labels": daily_labels, "data": daily_values}
-        }
-    except Exception:
-        return {
-            "coin_stats": {s: {"trades": 0, "profit": 0.0} for s in SYMBOLS},
-            "hourly_chart": {"labels": [], "data": []},
-            "daily_chart": {"labels": [], "data": []}
+            "ok": True,
+            "symbol": symbol,
+            "price": avg,
+            "qty": sold_qty,
+            "pnl": pnl,
+            "mode": mode
         }
 
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    def _send():
+
+def tick():
+    for symbol in SYMBOLS:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}).encode()
-            req = urllib.request.Request(url, data=data)
-            urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass
-    threading.Thread(target=_send, daemon=True).start()
-
-lock = threading.RLock()
-st = load_state()
-
-bot = {
-    "live_mode": False,
-    "demo_balance": st["demo_balance"],
-    "live_balance": 0.0,
-    "total_buys": st["total_buys"],
-    "total_sells": st["total_sells"],
-    "wins": st["wins"],
-    "realized_pnl": st["realized_pnl"],
-    "pnl_1h": st["pnl_1h"],
-    "pnl_24h": st["pnl_24h"],
-    "trades_1h": st["trades_1h"],
-    "trades_24h": st["trades_24h"],
-    "history": load_initial_history(),
-    "logs": deque(maxlen=25),
-    "markets": {},
-    "klines_cache": {},
-    "last_radar_event": None
-}
-
-for sym in SYMBOLS:
-    bot["markets"][sym] = {
-        "running": False,
-        "price": 0.0,
-        "buyer_ratio": 50.0,
-        "amount": 10.0,
-        "stop_loss": 50.0,
-        "take_profit": 0.5,
-        "no_loss_mode": True,
-        "dca_orders": [],
-        "position": None,
-        "unrealized_pnl": 0.0,
-        "cooldown_until": 0,
-        "bids": [],
-        "asks": []
-    }
-    bot["klines_cache"][sym] = []
-
-def add_log(msg):
-    bot["logs"].appendleft(f"[{time.strftime('%H:%M:%S')}] {msg}")
-
-def balance_sync_loop():
-    last_err = ""
-    while True:
-        try:
-            if bot["live_mode"] and BINANCE_API_KEY and BINANCE_API_SECRET:
-                bal, err = get_live_balance()
-                with lock:
-                    if err:
-                        if err != last_err:
-                            add_log(f"[বাইনান্স ব্যালেন্স এরর] {err}")
-                            last_err = err
-                    else:
-                        bot["live_balance"] = bal
-                        if last_err:
-                            add_log(f"[বাইনান্স কানেক্টেড] লাইভ ব্যালেন্স: ${bal:.2f}")
-                            last_err = ""
-            time.sleep(4)
-        except Exception:
-            time.sleep(4)
-
-threading.Thread(target=balance_sync_loop, daemon=True).start()
-
-def market_engine(symbol):
-    while True:
-        try:
-            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=4) as r:
-                klines = json.loads(r.read().decode())
-
-            price = float(klines[-1][4])
-            formatted_klines = [
-                {"time": int(k[0] // 1000), "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
-                for k in klines
-            ]
-
-            req_d = urllib.request.Request(f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5", headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_d, timeout=4) as r:
-                depth = json.loads(r.read().decode())
-
-            bids = depth.get("bids", [])
-            asks = depth.get("asks", [])
-            tot_bids = sum(float(b[1]) for b in bids) if bids else 1.0
-            tot_asks = sum(float(a[1]) for a in asks) if asks else 1.0
-            b_ratio = round((tot_bids / (tot_bids + tot_asks)) * 100, 1)
+            price = bn.price(symbol)
 
             with lock:
-                m = bot["markets"][symbol]
-                m["price"] = price
-                m["buyer_ratio"] = b_ratio
-                m["bids"] = bids
-                m["asks"] = asks
-                bot["klines_cache"][symbol] = formatted_klines
+                state["symbols"][symbol]["price"] = price
+                state["updated"] = utcnow()
 
-                now = time.time()
-                orders = m["dca_orders"]
+            previous = last_prices.get(symbol)
+            last_prices[symbol] = price
+            pos = get_position(symbol)
 
-                if len(orders) > 0:
-                    total_qty = sum(o["qty"] for o in orders)
-                    total_cost = sum(o["cost"] for o in orders)
-                    avg_price = total_cost / total_qty
-                    diff = ((price - avg_price) / avg_price) * 100
-                    m["unrealized_pnl"] = round(diff, 2)
+            if pos:
+                entry = float(pos["entry"])
+                pnl_pct = (price - entry) / entry * 100
 
-                    is_take_profit = (diff >= m["take_profit"])
-                    is_stop_loss = (not m["no_loss_mode"]) and (diff <= -m["stop_loss"])
+                state["symbols"][symbol]["status"] = (
+                    f"Open: {pnl_pct:+.2f}%"
+                )
 
-                    last_buy = orders[-1]["price"]
-                    if (price <= last_buy * 0.985) and (len(orders) < 3) and (now > m["cooldown_until"]):
-                        buy_amt = m["amount"]
-                        orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
-                        bot["total_buys"] += 1
-                        m["cooldown_until"] = now + 15
-                        bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                        add_log(f"[{symbol}] 🟢 DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
-                        send_telegram(f"⚡ *[DCA BUY #{len(orders)}]* {symbol}\nPrice: `${price:.4f}`\nAvg Cost: `${(sum(o['cost'] for o in orders)/sum(o['qty'] for o in orders)):.4f}`")
-                        save_state()
+                if pnl_pct >= float(state["tp"]):
+                    sell_position(symbol, price, "Take Profit")
 
-                    elif is_take_profit or is_stop_loss:
-                        revenue = total_qty * price
-                        profit = revenue - total_cost
-                        bot["demo_balance"] += profit
-                        bot["realized_pnl"] += profit
-                        bot["pnl_1h"] += profit
-                        bot["pnl_24h"] += profit
-                        bot["total_sells"] += 1
-                        bot["trades_1h"] += 1
-                        bot["trades_24h"] += 1
-                        if profit > 0:
-                            bot["wins"] += 1
-                        save_state()
+                elif pnl_pct <= -float(state["sl"]):
+                    if state["no_loss"]:
+                        state["symbols"][symbol]["status"] = (
+                            "NO-LOSS HOLD: loss threshold reached"
+                        )
+                    else:
+                        sell_position(symbol, price, "Stop Loss")
 
-                        side_name = "TAKE PROFIT" if diff > 0 else "STOP LOSS"
-                        bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
-                        add_log(f"[{symbol}] 🔴 {side_name} ({len(orders)}x DCA): {profit:+.2f}$ ({diff:+.2f}%)")
-                        send_telegram(f"🎯 *[{side_name}]* {symbol} ({len(orders)}x DCA)\nExit: `${price:.4f}`\nPnL: `{diff:+.2f}%` (`{profit:+.2f}$`)")
-                        log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), f"{side_name} ({len(orders)}x DCA)")
+            elif (
+                state["running"]
+                and state["strategy"]
+                and state["symbols"][symbol]["enabled"]
+            ):
+                if previous and previous > 0:
+                    change = (price - previous) / previous * 100
 
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": symbol,
-                            "side": f"SELL({len(orders)}x)",
-                            "price": round(price, 4),
-                            "pnl": round(diff, 2)
-                        })
-                        m["dca_orders"] = []
-                        m["position"] = None
-                        m["unrealized_pnl"] = 0.0
-                        m["cooldown_until"] = now + 10
+                    if (
+                        change >= 0.15
+                        and time.time() - last_buy_time.get(symbol, 0) > 300
+                    ):
+                        buy_symbol(symbol, "Momentum signal")
+                        last_buy_time[symbol] = time.time()
 
-                    m["position"] = {"buy_price": avg_price, "amount": total_cost} if len(orders) > 0 else None
+            if not get_position(symbol):
+                state["symbols"][symbol]["status"] = (
+                    "Watching"
+                    if state["symbols"][symbol]["enabled"]
+                    else "Paused"
+                )
 
-                elif m["running"]:
-                    active_positions = sum(1 for k in bot["markets"].values() if len(k["dca_orders"]) > 0)
-                    if (now > m["cooldown_until"]) and (active_positions < MAX_OPEN_POSITIONS):
-                        buy_amt = m["amount"]
-                        m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
-                        m["position"] = {"buy_price": price, "amount": buy_amt}
-                        m["unrealized_pnl"] = 0.0
-                        bot["total_buys"] += 1
-                        bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                        save_state()
+        except Exception as e:
+            log.warning("%s: %s", symbol, e)
+            state["error"] = str(e)[:300]
+            state["symbols"][symbol]["status"] = "Error"
 
-                        add_log(f"[{symbol}] 🟢 বেস বাই @ ${price:.4f}")
-                        send_telegram(f"⚡ *[BASE BUY]* {symbol}\nPrice: `${price:.4f}`\nTarget: `+{m['take_profit']}%`")
-                        log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Base Entry")
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": symbol,
-                            "side": "BUY",
-                            "price": round(price, 4),
-                            "pnl": 0.0
-                        })
 
-            time.sleep(1.5)
-        except Exception:
-            time.sleep(2)
+def worker():
+    while True:
+        if state["running"]:
+            tick()
+        time.sleep(max(5, int(state["poll"])))
 
-for sym in SYMBOLS:
-    threading.Thread(target=market_engine, args=(sym,), daemon=True).start()
 
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="bn" data-theme="cyberpunk">
+HTML = r"""<!doctype html>
+<html lang="bn">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CYBERPUNK NEON TERMINAL ULTRA</title>
-<script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crypto Bot Pro</title>
 <style>
-:root {
-  --bg: #03000a; --panel: rgba(14, 5, 29, 0.96); --cyan: #00f0ff; --purple: #ff0077;
-  --green: #00ff66; --red: #ff0044; --border-cyan: #00f0ff; --border-pink: #ff0077;
-  --text: #ffffff; --text-dim: #a1a1aa;
-}
-[data-theme="binance"] { --bg: #121418; --panel: #1e2329; --cyan: #fcd535; --purple: #fcd535; --green: #0ecb81; --red: #f6465d; --border-cyan: #2b313a; --border-pink: #fcd535; }
-[data-theme="tokyo"] { --bg: #131224; --panel: #1c1a35; --cyan: #c77dff; --purple: #ff5400; --green: #70e000; --red: #ff0054; --border-cyan: #9d4edd; --border-pink: #ff5400; }
-[data-theme="matrix"] { --bg: #020b05; --panel: #05180b; --cyan: #00ff41; --purple: #00ff41; --green: #00ff41; --red: #ff3333; --border-cyan: #00ff41; --border-pink: #00ff41; }
-[data-theme="oled"] { --bg: #000000; --panel: #0d0d0d; --cyan: #3b82f6; --purple: #3b82f6; --green: #22c55e; --red: #ef4444; --border-cyan: #262626; --border-pink: #3b82f6; }
-
-* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; }
-body { background-color: var(--bg); color: var(--text); padding: 10px; min-height: 100vh; }
-.mono { font-family: 'JetBrains Mono', monospace; }
-.icon { width: 14px; height: 14px; vertical-align: middle; fill: currentColor; display: inline-block; }
-
-.header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 10px; box-shadow: 0 0 10px rgba(255, 0, 119, 0.4); }
-.header-left { display: flex; align-items: center; gap: 8px; }
-.profile-avatar { width: 34px; height: 34px; border-radius: 50%; border: 2px solid var(--cyan); object-fit: cover; cursor: pointer; }
-.brand { font-size: 13px; font-weight: 900; color: var(--cyan); letter-spacing: 0.5px; display: flex; align-items: center; gap: 5px; }
-
-select { background: #000; color: #fff; border: 1px solid var(--border-cyan); padding: 4px 6px; border-radius: 6px; font-size: 10px; }
-.mode-badge { padding: 5px 12px; border-radius: 8px; font-weight: 800; font-size: 10px; cursor: pointer; transition: 0.2s; user-select: none; }
-.mode-demo { background: rgba(0, 240, 255, 0.2); color: var(--cyan); border: 1.5px solid var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,0.4); }
-.mode-live { background: rgba(255, 0, 68, 0.35); color: #fff; border: 1.5px solid var(--red); box-shadow: 0 0 10px rgba(255,0,68,0.5); }
-
-.page-nav { display: flex; gap: 8px; margin-bottom: 10px; }
-.page-tab-btn { flex: 1; padding: 10px; border-radius: 10px; border: 1.5px solid rgba(255, 0, 119, 0.5); background: var(--panel); color: var(--text-dim); font-weight: 800; font-size: 11px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
-.page-tab-btn.active { background: rgba(0, 240, 255, 0.2); border-color: var(--cyan); color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,0.3); }
-
-.analytics-panel { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin-bottom: 10px; }
-.an-card { background: var(--panel); border: 1px solid var(--border-pink); border-radius: 8px; padding: 6px 2px; text-align: center; }
-.an-title { font-size: 8px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 2px; font-weight: 700; }
-.an-val { font-size: 12px; font-weight: 800; }
-
-.market-nav { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-bottom: 10px; }
-.market-tab { background: var(--panel); border: 1.5px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 6px 1px; cursor: pointer; text-align: center; position: relative; }
-.market-tab.active { background: rgba(255, 0, 119, 0.25); border-color: var(--purple); box-shadow: 0 0 8px rgba(255,0,119,0.3); }
-.tab-name { font-size: 10px; font-weight: 900; }
-.tab-price { font-size: 8.5px; font-weight: 700; color: var(--cyan); margin-top: 1px; }
-.tab-status { font-size: 7.5px; margin-top: 1px; font-weight: bold; }
-.tab-dca-badge { font-size: 7px; color: var(--cyan); margin-top: 1px; font-weight: bold; }
-
-.view-section { display: none; }
-.view-section.active { display: block; }
-
-.main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
-@media(max-width: 860px) { .main-grid { grid-template-columns: 1fr; } }
-
-.box { background: var(--panel); border: 1.5px solid var(--border-cyan); border-radius: 10px; padding: 10px; margin-bottom: 10px; box-shadow: 0 0 10px rgba(0,240,255,0.2); }
-.box-head { font-size: 12px; font-weight: 800; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: var(--cyan); }
-
-#chart { height: 280px; width: 100%; border-radius: 6px; }
-
-.chart-type-btn { background: transparent; border: 1px solid var(--border-cyan); color: var(--text); padding: 2px 6px; border-radius: 4px; font-size: 9px; cursor: pointer; }
-.chart-type-btn.active { background: var(--cyan); color: #000; font-weight: bold; }
-
-.sentiment-box { margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(255, 0, 119, 0.3); }
-.bar-wrap { height: 6px; width: 100%; background: var(--red); border-radius: 4px; overflow: hidden; margin: 4px 0; display: flex; }
-.bar-fill { height: 100%; background: var(--green); transition: width 0.4s ease; }
-
-.ob-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; font-size: 10px; }
-.ob-table { width: 100%; border-collapse: collapse; }
-.ob-table td { padding: 2px 0; }
-.ob-table td:last-child { text-align: right; color: var(--text-dim); }
-
-.row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11px; }
-.row input { width: 80px; text-align: center; background: #000; color: var(--cyan); border: 1.5px solid var(--border-cyan); padding: 4px; border-radius: 4px; font-weight: bold; }
-
-.toggle-switch-row {
-  display: flex; justify-content: space-between; align-items: center;
-  background: rgba(0, 255, 102, 0.1); border: 1px solid rgba(0, 255, 102, 0.4);
-  padding: 6px 8px; border-radius: 6px; margin-bottom: 8px;
-}
-.switch { position: relative; display: inline-block; width: 34px; height: 18px; }
-.switch input { opacity: 0; width: 0; height: 0; }
-.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .3s; border-radius: 18px; }
-.slider:before { position: absolute; content: ""; height: 12px; width: 12px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
-input:checked + .slider { background-color: var(--green); }
-input:checked + .slider:before { transform: translateX(16px); }
-
-.api-vault-btn { background: rgba(0, 240, 255, 0.15); color: var(--cyan); border: 1.5px solid var(--cyan); border-radius: 6px; padding: 6px 10px; width: 100%; font-size: 11px; font-weight: 800; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; margin-bottom: 8px; }
-.api-vault-modal { display: none; background: rgba(0,0,0,0.85); border: 2px solid var(--purple); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.api-vault-modal input { width: 100%; margin-bottom: 6px; padding: 6px; font-size: 10px; background: #000; color: #fff; border: 1px solid var(--border-pink); border-radius: 4px; }
-
-.btn { width: 100%; padding: 8px; border: none; border-radius: 6px; font-weight: 800; cursor: pointer; font-size: 11px; margin-top: 4px; }
-.btn-save { background: rgba(255, 0, 119, 0.3); color: #fff; border: 1.5px solid var(--purple); margin-bottom: 5px; }
-.btn-manual-buy { background: rgba(0, 255, 102, 0.25); color: var(--green); border: 1.5px solid var(--green); }
-.btn-manual-sell { background: rgba(255, 0, 68, 0.3); color: #fff; border: 1.5px solid var(--red); }
-.btn-tg-test { background: rgba(0, 240, 255, 0.2); color: var(--cyan); border: 1.5px solid var(--cyan); margin-bottom: 5px; }
-.btn-on { background: linear-gradient(135deg, var(--green), #00f0ff); color: #021208; font-weight: 900; }
-.btn-off { background: linear-gradient(135deg, var(--red), var(--purple)); color: #fff; font-weight: 900; }
-
-.log-box { background: #000; border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px; height: 80px; overflow-y: hidden; font-size: 10px; line-height: 1.5; color: var(--cyan); }
-.hist-table { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 4px; }
-.hist-table th, .hist-table td { border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding: 4px 2px; text-align: center; }
-
-.radar-panel {
-  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-around;
-  background: rgba(3, 10, 24, 0.95); border: 1.5px solid var(--cyan);
-  border-radius: 10px; padding: 12px; margin-top: 10px;
-  box-shadow: 0 0 15px rgba(0, 240, 255, 0.2);
-}
-.radar-canvas-box { text-align: center; }
-#masterRadar {
-  background: radial-gradient(circle, #022033 0%, #030a17 80%);
-  border-radius: 50%; border: 2px solid var(--cyan);
-  box-shadow: 0 0 15px var(--cyan) inset;
-}
-.radar-hud-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
-  flex: 1; min-width: 260px; margin-left: 12px;
-}
-@media(max-width: 600px) { .radar-hud-grid { grid-template-columns: repeat(2, 1fr); margin-left: 0; margin-top: 10px; } }
-.hud-coin-card {
-  background: #081026; border: 1px solid #1e293b; border-radius: 6px;
-  padding: 6px; text-align: center; position: relative;
-}
-.hud-coin-card.buy-pulse { border-color: var(--green); box-shadow: 0 0 10px var(--green); }
-.hud-coin-card.sell-pulse { border-color: var(--red); box-shadow: 0 0 10px var(--red); }
+body{margin:0;background:#0b1020;color:#e8eefc;font:15px system-ui;padding:16px}
+main{max-width:1100px;margin:auto}
+.card{background:#151e33;border:1px solid #2d3b5b;border-radius:14px;padding:16px;margin:12px 0;overflow:auto}
+button,input{padding:9px;border-radius:8px;border:1px solid #415477;margin:4px;background:#10192b;color:#fff}
+button{cursor:pointer;background:#165dce}
+table{width:100%;border-collapse:collapse}
+td,th{text-align:left;padding:8px;border-bottom:1px solid #34415a}
+small{color:#a9b8d4}
+.warn{color:#ffcb6b}
+pre{white-space:pre-wrap}
 </style>
 </head>
 <body>
+<main>
+<h1>⚡ Crypto Bot Pro</h1>
+<p>Binance Spot · Telegram · Dashboard</p>
 
-<div class="header">
-  <div class="header-left">
-    <input type="file" id="avatar-input" accept="image/*" style="display:none;" onchange="saveProfilePic(event)">
-    <img id="user-avatar" class="profile-avatar" title="ছবি পরিবর্তন করতে চাপুন" onclick="document.getElementById('avatar-input').click()" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='34' height='34' viewBox='0 0 24 24' fill='%2300f0ff'><circle cx='12' cy='8' r='4'/><path d='M12 14c-5 0-8 3-8 6v1h16v-1c0-3-3-6-8-6z'/></svg>">
-    <div class="brand">
-      <svg class="icon" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-      CYBERPUNK NEON TERMINAL
-    </div>
-  </div>
-
-  <div style="display:flex; align-items:center; gap:5px;">
-    <select onchange="applyTheme(this.value)">
-      <option value="cyberpunk">Cyberpunk Neon</option>
-      <option value="binance">Binance Dark</option>
-      <option value="tokyo">Tokyo Midnight</option>
-      <option value="matrix">Matrix Green</option>
-      <option value="oled">OLED Pitch Black</option>
-    </select>
-    <div class="mode-badge mode-demo" id="mode-toggle" onclick="toggleTradingMode()">DEMO MODE</div>
-    <select id="lang-sel">
-      <option value="bn">বাংলা</option>
-      <option value="en">English</option>
-    </select>
-  </div>
+<div class="card">
+<h2>Bot status</h2>
+<p id="status">Loading…</p>
+<button onclick="post('/api/start')">Start bot</button>
+<button onclick="post('/api/stop')">Stop bot</button>
 </div>
 
-<div class="page-nav">
-  <button class="page-tab-btn active" id="tab-btn-trade" onclick="switchPage('trade')">
-    <svg class="icon" viewBox="0 0 24 24"><path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/></svg>
-    <span>লাইভ ট্রেডিং টার্মিনাল</span>
-  </button>
-  <button class="page-tab-btn" id="tab-btn-pnl" onclick="switchPage('pnl')">
-    <svg class="icon" viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2V7h2v10zm4 0h-2v-4h2v4z"/></svg>
-    <span>লাভ-লস ও গ্রাফ অ্যানালিটিক্স</span>
-  </button>
+<div class="card">
+<h2>Trading mode</h2>
+<p class="warn">LIVE চালু থাকলে আসল অর্ডার হতে পারে।</p>
+<button onclick="toggleLive(true)">Enable LIVE</button>
+<button onclick="toggleLive(false)">Disable LIVE</button>
+<button onclick="post('/api/check-api')">Check Binance API</button>
+<button onclick="post('/api/test-telegram')">Test Telegram</button>
+<pre id="msg"></pre>
 </div>
 
-<div class="analytics-panel">
-  <div class="an-card"><div class="an-title">মোট লাভ / ক্ষতি</div><div class="an-val mono" id="v-all-pnl" style="color:var(--green);">$0.00</div></div>
-  <div class="an-card"><div class="an-title">গত ১ ঘণ্টার লাভ</div><div class="an-val mono" id="v-1h-pnl">$0.00</div><div style="font-size:7.5px; color:var(--text-dim);" id="v-1h-tr">০টি ট্রেড</div></div>
-  <div class="an-card"><div class="an-title">আজকের লাভ (২৪ ঘণ্টা)</div><div class="an-val mono" id="v-24h-pnl">$0.00</div><div style="font-size:7.5px; color:var(--text-dim);" id="v-24h-tr">০টি ট্রেড</div></div>
-  <div class="an-card"><div class="an-title">মোট বাই / সেল</div><div class="an-val mono" style="font-size:10px;"><span style="color:var(--green);" id="v-tot-buy">0 BUY</span> / <span style="color:var(--red);" id="v-tot-sell">0 SELL</span></div></div>
-  <div class="an-card"><div class="an-title">উইন রেট (Win%)</div><div class="an-val mono" id="v-winrate" style="color:var(--cyan);">0%</div></div>
-  <div class="an-card"><div class="an-title">USDT ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--green);">$1000.00</div></div>
+<div class="card">
+<h2>Settings</h2>
+<label>Trade USDT <input id="amount" type="number" value="10" min="5"></label>
+<label>Stop Loss % <input id="sl" type="number" value="1.5" min=".1" step=".1"></label>
+<label>Take Profit % <input id="tp" type="number" value="2" min=".1" step=".1"></label>
+<label>Max positions <input id="maxpos" type="number" value="3" min="1" max="8"></label>
+<label>Poll seconds <input id="poll" type="number" value="15" min="5"></label>
+<p>
+<label><input id="strategy" type="checkbox"> Automatic strategy</label>
+<label><input id="noloss" type="checkbox" checked> No-Loss Hold</label>
+</p>
+<button onclick="saveSettings()">Save settings</button>
+<p class="warn">No-Loss Hold Stop Loss threshold-এ পৌঁছালেও position ধরে রাখে।</p>
 </div>
 
-<div id="view-trade" class="view-section active">
-  <div class="market-nav">
-    <div class="market-tab active" onclick="selectMarket('BTCUSDT', this)"><div class="tab-name">BTC</div><div class="tab-price mono" id="tab-price-BTCUSDT">$0.00</div><div class="tab-status" id="tab-st-BTCUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-BTCUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('ETHUSDT', this)"><div class="tab-name">ETH</div><div class="tab-price mono" id="tab-price-ETHUSDT">$0.00</div><div class="tab-status" id="tab-st-ETHUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-ETHUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('SOLUSDT', this)"><div class="tab-name">SOL</div><div class="tab-price mono" id="tab-price-SOLUSDT">$0.00</div><div class="tab-status" id="tab-st-SOLUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-SOLUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('BNBUSDT', this)"><div class="tab-name">BNB</div><div class="tab-price mono" id="tab-price-BNBUSDT">$0.00</div><div class="tab-status" id="tab-st-BNBUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-BNBUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('XRPUSDT', this)"><div class="tab-name">XRP</div><div class="tab-price mono" id="tab-price-XRPUSDT">$0.00</div><div class="tab-status" id="tab-st-XRPUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-XRPUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('ADAUSDT', this)"><div class="tab-name">ADA</div><div class="tab-price mono" id="tab-price-ADAUSDT">$0.00</div><div class="tab-status" id="tab-st-ADAUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-ADAUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('DOGEUSDT', this)"><div class="tab-name">DOGE</div><div class="tab-price mono" id="tab-price-DOGEUSDT">$0.00</div><div class="tab-status" id="tab-st-DOGEUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-DOGEUSDT">DCA: 0/3</div></div>
-    <div class="market-tab" onclick="selectMarket('AVAXUSDT', this)"><div class="tab-name">AVAX</div><div class="tab-price mono" id="tab-price-AVAXUSDT">$0.00</div><div class="tab-status" id="tab-st-AVAXUSDT">OFF</div><div class="tab-dca-badge" id="tab-dca-AVAXUSDT">DCA: 0/3</div></div>
-  </div>
-
-  <div class="main-grid">
-    <div>
-      <div class="box">
-        <div class="box-head">
-          <span>লাইভ ক্যান্ডেল চার্ট: <b style="color:var(--cyan);" id="chart-sym">BTCUSDT</b></span>
-          <div style="display:flex; gap:3px;">
-            <button class="chart-type-btn active" onclick="switchChartType('candlestick', this)">ক্যান্ডেল</button>
-            <button class="chart-type-btn" onclick="switchChartType('area', this)">এরিয়া</button>
-            <button class="chart-type-btn" onclick="switchChartType('line', this)">লাইন</button>
-            <button class="chart-type-btn" onclick="switchChartType('bar', this)">বার</button>
-          </div>
-        </div>
-        <div id="chart"></div>
-
-        <div class="sentiment-box">
-          <div style="display:flex; justify-content:space-between; font-size:10px;">
-            <span style="color:var(--green); font-weight:800;">ক্রেতা শক্তি: <span id="buy-pct">50%</span></span>
-            <span style="color:var(--red); font-weight:800;">বিক্রেতা শক্তি: <span id="sell-pct">50%</span></span>
-          </div>
-          <div class="bar-wrap">
-            <div class="bar-fill" id="buy-bar" style="width: 50%;"></div>
-          </div>
-        </div>
-
-        <div class="ob-grid mono">
-          <div><b style="color:var(--green);">BIDS (ক্রয়াদেশ)</b><table class="ob-table" id="bids-list"></table></div>
-          <div><b style="color:var(--red);">ASKS (বিক্রয়াদেশ)</b><table class="ob-table" id="asks-list"></table></div>
-        </div>
-      </div>
-
-      <div class="radar-panel">
-        <div class="radar-canvas-box">
-          <div style="font-size:11px; color:var(--cyan); font-weight:bold; margin-bottom:6px;">TACTICAL TARGET RADAR</div>
-          <canvas id="masterRadar" width="220" height="220"></canvas>
-          <div id="radarEventText" class="mono" style="font-size:10px; color:var(--green); margin-top:6px;">RADAR: SCANNING 8 PAIRS</div>
-        </div>
-        <div class="radar-hud-grid mono" id="hudGrid"></div>
-      </div>
-    </div>
-
-    <div>
-      <button class="api-vault-btn" onclick="toggleApiVault()">
-        <svg class="icon" viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-        <span>Binance API ভল্ট (গোপন ও এনক্রিপ্টেড)</span>
-      </button>
-
-      <div class="api-vault-modal" id="api-vault-box">
-        <div style="font-size:10px; color:var(--purple); font-weight:bold; margin-bottom:5px;">Binance API Key ও Secret:</div>
-        <input type="password" id="api-key" placeholder="API Key পেস্ট করুন" class="mono" autocomplete="off">
-        <input type="password" id="api-sec" placeholder="Secret Key পেস্ট করুন" class="mono" autocomplete="off">
-        <div style="display:flex; gap:5px; margin-bottom:5px;">
-          <button class="btn" style="padding:5px; font-size:10px; background:#222; color:#fff;" onclick="toggleSecretVisibility()">দেখুন / লুকান</button>
-          <button class="btn btn-save" style="margin:0; padding:5px; font-size:10px;" onclick="saveApiKeys()">সংরক্ষণ করুন</button>
-        </div>
-        <button class="btn" style="background:#550011; color:#ff6688; border:1px solid #ff0044; padding:5px; font-size:10px;" onclick="clearApiKeys()">কী মুছুন / রিসেট</button>
-      </div>
-
-      <div class="box">
-        <div class="box-head">
-          <span id="cfg-sym">BTCUSDT</span>
-          <span id="active-pnl-label" class="mono" style="font-size:10px; color:var(--text-dim);">ওপেন ট্রেড: নাই</span>
-        </div>
-
-        <div class="toggle-switch-row">
-          <span style="color:var(--green); font-weight:bold;">🛡️ নো-লস মোড (লাভ ছাড়া সেল নয়):</span>
-          <label class="switch">
-            <input type="checkbox" id="no-loss-chk" checked onchange="toggleNoLoss(this.checked)">
-            <span class="slider"></span>
-          </label>
-        </div>
-
-        <div class="row"><span>ট্রেড সাইজ ($):</span><input class="mono" id="amt" type="number" value="10"></div>
-        <div class="row"><span>স্টপ লস (%):</span><input class="mono" id="sl" type="number" step="0.01" value="50.0"></div>
-        <div class="row"><span>টেক প্রফিট (%):</span><input class="mono" id="tp" type="number" step="0.01" value="0.5"></div>
-        <button class="btn btn-save" onclick="saveCurrentConfig()">সেটিংস সেভ করুন</button>
-
-        <div style="display:flex; gap:5px; margin-bottom:5px;">
-          <button class="btn btn-manual-buy" onclick="instantBuy()">তাৎক্ষণিক বাই টেস্ট</button>
-          <button class="btn btn-manual-sell" onclick="instantSell()">ট্রেড সেল/ক্লোজ</button>
-        </div>
-
-        <button class="btn btn-tg-test" onclick="testTelegram()">টেলিগ্রাম টেস্ট মেসেজ</button>
-        <button id="pwr-btn" class="btn btn-on" onclick="toggleCurrentMarket()">চালু করুন (BTC)</button>
-      </div>
-
-      <div class="box">
-        <div class="box-head">অ্যাকশন ও টেলিগ্রাম লগ</div>
-        <div class="log-box mono" id="logs"></div>
-      </div>
-
-      <div class="box">
-        <div class="box-head">লাইভ ট্রেড হিস্ট্রি</div>
-        <table class="hist-table mono">
-          <thead><tr><th>সময়</th><th>কয়েন</th><th>অর্ডার</th><th>PnL</th></tr></thead>
-          <tbody id="hist"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
+<div class="card">
+<h2>Markets</h2>
+<table>
+<thead><tr><th>Symbol</th><th>Price (USDT)</th><th>Status</th><th>Enabled</th><th>Actions</th></tr></thead>
+<tbody id="markets"></tbody>
+</table>
 </div>
 
-<div id="view-pnl" class="view-section">
-  <div class="analytics-chart-box">
-    <div class="box-head">
-      <span style="color:var(--cyan); font-weight:800;">গত ২৪ ঘণ্টার প্রতি ঘণ্টার লাভ/ক্ষতি গ্রাফ (Hourly PnL)</span>
-      <span style="font-size:10px; color:var(--text-dim);" class="mono">রিয়েল-টাইম</span>
-    </div>
-    <div class="chart-container-pnl">
-      <canvas id="hourlyChartCanvas"></canvas>
-    </div>
-  </div>
-
-  <div class="analytics-chart-box" style="border-color: var(--border-pink);">
-    <div class="box-head">
-      <span style="color:var(--purple); font-weight:800;">গত ৭ দিনের দৈনিক মোট লাভ/ক্ষতি গ্রাফ (Daily PnL)</span>
-      <span style="font-size:10px; color:var(--text-dim);" class="mono">দৈনিক হিসাব</span>
-    </div>
-    <div class="chart-container-pnl">
-      <canvas id="dailyChartCanvas"></canvas>
-    </div>
-  </div>
-
-  <div class="box">
-    <div class="box-head">কয়েনভিত্তিক একক পারফরম্যান্স ব্রেকডাউন</div>
-    <table class="coin-breakdown-table mono">
-      <thead><tr><th>কয়েন</th><th>ট্রেড সংখ্যা</th><th>নিট অর্জিত লাভ / ক্ষতি</th></tr></thead>
-      <tbody id="coin-stats-body"></tbody>
-    </table>
-  </div>
+<div class="card">
+<h2>Open positions</h2>
+<table>
+<thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Spent</th><th>Mode</th><th>Action</th></tr></thead>
+<tbody id="positions"></tbody>
+</table>
 </div>
+
+<div class="card">
+<h2>Trade history</h2>
+<table>
+<thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>P/L</th><th>Reason</th><th>Mode</th></tr></thead>
+<tbody id="history"></tbody>
+</table>
+</div>
+</main>
 
 <script>
-let activeSymbol = "BTCUSDT";
-let userEditing = false;
-let curChartType = "candlestick";
-let chartDataCache = [];
-let isLiveTrading = false;
-
-function applyTheme(t) {
-  document.documentElement.setAttribute('data-theme', t);
-  const colors = { cyberpunk: '#03000a', binance: '#121418', tokyo: '#131224', matrix: '#020b05', oled: '#000000' };
-  ch.applyOptions({ layout: { background: { color: colors[t] || '#03000a' } } });
-}
-
-function switchPage(page) {
-  document.getElementById('view-trade').classList.remove('active');
-  document.getElementById('view-pnl').classList.remove('active');
-  document.getElementById('tab-btn-trade').classList.remove('active');
-  document.getElementById('tab-btn-pnl').classList.remove('active');
-
-  if(page === 'trade') {
-    document.getElementById('view-trade').classList.add('active');
-    document.getElementById('tab-btn-trade').classList.add('active');
-  } else {
-    document.getElementById('view-pnl').classList.add('active');
-    document.getElementById('tab-btn-pnl').classList.add('active');
-    setTimeout(() => {
-      if(hourlyChartInstance) hourlyChartInstance.resize();
-      if(dailyChartInstance) dailyChartInstance.resize();
-    }, 100);
-  }
-}
-
-window.addEventListener('load', () => {
-  const savedPic = localStorage.getItem('user_terminal_avatar');
-  if(savedPic) document.getElementById('user-avatar').src = savedPic;
-  const k = localStorage.getItem('saved_binance_key');
-  const s = localStorage.getItem('saved_binance_sec');
-  if(k) document.getElementById('api-key').value = k;
-  if(s) document.getElementById('api-sec').value = s;
-});
-
-function saveProfilePic(e) {
-  const file = e.target.files[0];
-  if(file) {
-    const reader = new FileReader();
-    reader.onload = function(evt) {
-      document.getElementById('user-avatar').src = evt.target.result;
-      localStorage.setItem('user_terminal_avatar', evt.target.result);
-    };
-    reader.readAsDataURL(file);
-  }
-}
-
-function toggleApiVault() {
-  const f = document.getElementById('api-vault-box');
-  f.style.display = (f.style.display === 'block') ? 'none' : 'block';
-}
-
-function toggleSecretVisibility() {
-  const k = document.getElementById('api-key');
-  const s = document.getElementById('api-sec');
-  const t = k.type === 'password' ? 'text' : 'password';
-  k.type = t;
-  s.type = t;
-}
-
-function toggleTradingMode() {
-  fetch('/api/toggle_mode', {method:'POST'}).then(r=>r.json()).then(d=>{
-    isLiveTrading = d.live_mode;
-    const b = document.getElementById('mode-toggle');
-    b.className = isLiveTrading ? "mode-badge mode-live" : "mode-badge mode-demo";
-    b.innerText = isLiveTrading ? "LIVE TRADING" : "DEMO MODE";
+async function post(url,data={}){
+ try{
+  const r=await fetch(url,{
+   method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify(data)
   });
+  const d=await r.json();
+  document.getElementById('msg').textContent=JSON.stringify(d,null,2);
+  await refresh();
+  return d;
+ }catch(e){
+  document.getElementById('msg').textContent=String(e);
+ }
 }
 
-function saveApiKeys() {
-  const k = document.getElementById('api-key').value.trim();
-  const s = document.getElementById('api-sec').value.trim();
-  if(!k || !s) { alert('API Key ও Secret পূরণ করুন!'); return; }
-  localStorage.setItem('saved_binance_key', k);
-  localStorage.setItem('saved_binance_sec', s);
-  fetch('/api/save_keys', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({key: k, secret: s})
-  }).then(r=>r.json()).then(d=>{
-    alert('API Key সফলভাবে সেভ হয়েছে!');
-    document.getElementById('api-vault-box').style.display = 'none';
-  });
+async function toggleLive(enabled){
+ if(enabled&&!confirm('LIVE চালু করবেন? এটি real order দিতে পারে।'))return;
+ await post('/api/live',{enabled});
 }
 
-function clearApiKeys() {
-  if(!confirm("আপনি কি নিশ্চিতভাবে API Key মুছে ফেলতে চান?")) return;
-  localStorage.removeItem('saved_binance_key');
-  localStorage.removeItem('saved_binance_sec');
-  document.getElementById('api-key').value = '';
-  document.getElementById('api-sec').value = '';
-  fetch('/api/delete_keys', {method:'POST'}).then(r=>r.json()).then(d=>{
-    alert('API Key মুছে ফেলা হয়েছে!');
-  });
+async function saveSettings(){
+ await post('/api/settings',{
+  trade_usdt:+document.getElementById('amount').value,
+  sl:+document.getElementById('sl').value,
+  tp:+document.getElementById('tp').value,
+  maxpos:+document.getElementById('maxpos').value,
+  poll:+document.getElementById('poll').value,
+  strategy:document.getElementById('strategy').checked,
+  no_loss:document.getElementById('noloss').checked
+ });
 }
 
-function selectMarket(sym, tabEl) {
-  activeSymbol = sym;
-  document.querySelectorAll('.market-tab').forEach(t => t.classList.remove('active'));
-  tabEl.classList.add('active');
-  document.getElementById('chart-sym').innerText = sym;
-  document.getElementById('cfg-sym').innerText = sym;
-  loadChartData(sym);
-  updateActiveControls();
+async function sym(symbol,enabled){
+ await post('/api/symbol',{symbol,enabled});
 }
 
-function updateActiveControls() {
-  fetch('/api/status').then(r=>r.json()).then(d=>{
-    const m = d.markets[activeSymbol];
-    if(m) {
-      const b = document.getElementById('pwr-btn');
-      b.className = m.running ? "btn btn-off" : "btn btn-on";
-      b.innerText = m.running ? "বন্ধ করুন (" + activeSymbol.replace('USDT','') + ")" : "চালু করুন (" + activeSymbol.replace('USDT','') + ")";
-      document.getElementById('no-loss-chk').checked = !!m.no_loss_mode;
-      if(!userEditing) {
-        document.getElementById('amt').value = m.amount;
-        document.getElementById('sl').value = m.stop_loss;
-        document.getElementById('tp').value = m.take_profit;
-      }
-    }
-  });
+async function buy(symbol){
+ if(confirm(symbol+' BUY করবেন?'))await post('/api/buy',{symbol});
 }
 
-function toggleNoLoss(val) {
-  fetch('/api/toggle_no_loss?symbol=' + encodeURIComponent(activeSymbol) + '&val=' + val, {method:'POST'});
+async function sell(symbol){
+ if(confirm(symbol+' SELL করবেন?'))await post('/api/sell',{symbol});
 }
 
-['amt', 'sl', 'tp', 'api-key', 'api-sec'].forEach(id => {
-  const el = document.getElementById(id);
-  if(el) {
-    el.addEventListener('focus', () => { userEditing = true; });
-    el.addEventListener('blur', () => { userEditing = false; });
-  }
-});
+async function refresh(){
+ try{
+  const d=await(await fetch('/api/state')).json();
+  const s=d.state;
 
-const ch = LightweightCharts.createChart(document.getElementById('chart'), {
-  layout: { background: { color: 'transparent' }, textColor: '#a1a1aa', fontSize: 10 },
-  grid: { vertLines: { color: 'rgba(255,0,119,0.08)' }, horzLines: { color: 'rgba(0,240,255,0.08)' } },
-  timeScale: { timeVisible: true, rightOffset: 5 }
-});
-let series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
+  document.getElementById('status').textContent=
+   (s.running?'Running':'Stopped')+' · '+(s.live?'LIVE':'DEMO')+
+   ' · '+(s.updated||'—')+(s.error?' · Error: '+s.error:'');
 
-function switchChartType(type, btn) {
-  document.querySelectorAll('.chart-type-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  ch.removeSeries(series);
-  curChartType = type;
+  document.getElementById('amount').value=s.trade_usdt;
+  document.getElementById('sl').value=s.sl;
+  document.getElementById('tp').value=s.tp;
+  document.getElementById('maxpos').value=s.maxpos;
+  document.getElementById('poll').value=s.poll;
+  document.getElementById('strategy').checked=s.strategy;
+  document.getElementById('noloss').checked=s.no_loss;
 
-  if (type === 'candlestick') {
-    series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
-    series.setData(chartDataCache);
-  } else if (type === 'area') {
-    series = ch.addAreaSeries({ topColor: 'rgba(0,240,255,0.35)', bottomColor: 'rgba(0,240,255,0.0)', lineColor: '#00f0ff', lineWidth: 2 });
-    series.setData(chartDataCache.map(k => ({ time: k.time, value: k.close })));
-  } else if (type === 'line') {
-    series = ch.addLineSeries({ color: '#00f0ff', lineWidth: 2 });
-    series.setData(chartDataCache.map(k => ({ time: k.time, value: k.close })));
-  } else if (type === 'bar') {
-    series = ch.addBarSeries({ upColor: '#00ff66', downColor: '#ff0044' });
-    series.setData(chartDataCache);
-  }
+  document.getElementById('markets').innerHTML=
+   Object.entries(s.symbols).map(([k,v])=>
+    '<tr><td>'+k+'</td><td>'+Number(v.price).toPrecision(8)+
+    '</td><td>'+v.status+'</td><td><input type="checkbox" '+
+    (v.enabled?'checked':'')+' onchange="sym(\\''+k+'\\',this.checked)">'+
+    '</td><td><button onclick="buy(\\''+k+'\\')">BUY</button></td></tr>'
+   ).join('');
+
+  document.getElementById('positions').innerHTML=
+   d.positions.map(p=>
+    '<tr><td>'+p.symbol+'</td><td>'+p.qty+'</td><td>'+p.entry+
+    '</td><td>'+p.spent+'</td><td>'+p.mode+
+    '</td><td><button onclick="sell(\\''+p.symbol+'\\')">SELL/CLOSE</button></td></tr>'
+   ).join('');
+
+  document.getElementById('history').innerHTML=
+   d.history.map(h=>
+    '<tr><td>'+h.time+'</td><td>'+h.symbol+'</td><td>'+h.side+
+    '</td><td>'+h.price+'</td><td>'+h.pnl+'</td><td>'+h.reason+
+    '</td><td>'+h.mode+'</td></tr>'
+   ).join('');
+
+ }catch(e){
+  document.getElementById('status').textContent='Dashboard error: '+e;
+ }
 }
 
-function loadChartData(sym) {
-  fetch('/api/klines?symbol=' + sym)
-    .then(r => r.json())
-    .then(d => {
-      chartDataCache = d;
-      if (curChartType === 'candlestick' || curChartType === 'bar') {
-        series.setData(d);
-      } else {
-        series.setData(d.map(k => ({ time: k.time, value: k.close })));
-      }
-      ch.timeScale().fitContent();
-    }).catch(e=>{});
-}
-loadChartData("BTCUSDT");
-
-function toggleCurrentMarket() {
-  fetch('/api/toggle?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}).then(r=>r.json()).then(d=>{
-    const b = document.getElementById('pwr-btn');
-    b.className = d.running ? "btn btn-off" : "btn btn-on";
-    b.innerText = d.running ? "বন্ধ করুন (" + activeSymbol.replace('USDT','') + ")" : "চালু করুন (" + activeSymbol.replace('USDT','') + ")";
-    const sEl = document.getElementById('tab-st-' + activeSymbol);
-    if(sEl) {
-      sEl.innerText = d.running ? "ACTIVE" : "OFF";
-      sEl.style.color = d.running ? "var(--green)" : "var(--text-dim)";
-    }
-  });
-}
-
-function instantBuy() {
-  fetch('/api/instant_buy?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}).then(r=>r.json()).then(()=>{
-    alert(activeSymbol + ' এ বাই কার্যকর!');
-  });
-}
-
-function instantSell() {
-  fetch('/api/instant_sell?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}).then(r=>r.json()).then(()=>{
-    alert(activeSymbol + ' ট্রেড সেল/ক্লোজ হয়েছে!');
-  });
-}
-
-function testTelegram() {
-  fetch('/api/test_tg', {method:'POST'}).then(r=>r.json()).then(()=>{
-    alert('টেলিগ্রামে টেস্ট বার্তা পাঠানো হয়েছে!');
-  });
-}
-
-function saveCurrentConfig() {
-  const p = {
-    symbol: activeSymbol,
-    amount: +document.getElementById('amt').value,
-    stop_loss: +document.getElementById('sl').value,
-    take_profit: +document.getElementById('tp').value,
-    no_loss_mode: document.getElementById('no-loss-chk').checked
-  };
-  fetch('/api/settings', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(p)
-  }).then(()=>{ alert(activeSymbol + ' এর সেটিংস সেভ হয়েছে!'); });
-}
-
-let hourlyChartInstance = null;
-let dailyChartInstance = null;
-
-function initPnlCharts() {
-  const ctxH = document.getElementById('hourlyChartCanvas').getContext('2d');
-  hourlyChartInstance = new Chart(ctxH, {
-    type: 'bar',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'Hourly PnL ($)',
-        data: [],
-        backgroundColor: 'rgba(0, 240, 255, 0.45)',
-        borderColor: '#00f0ff',
-        borderWidth: 2,
-        borderRadius: 4
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {
-        x: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } }
-      },
-      plugins: { legend: { display: false } }
-    }
-  });
-
-  const ctxD = document.getElementById('dailyChartCanvas').getContext('2d');
-  dailyChartInstance = new Chart(ctxD, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'Daily PnL ($)',
-        data: [],
-        borderColor: '#ff0077',
-        backgroundColor: 'rgba(255, 0, 119, 0.2)',
-        fill: true,
-        tension: 0.35,
-        borderWidth: 2.5,
-        pointBackgroundColor: '#00f0ff',
-        pointRadius: 4
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {
-        x: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: { ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } }, grid: { color: 'rgba(255,255,255,0.05)' } }
-      },
-      plugins: { legend: { display: false } }
-    }
-  });
-}
-initPnlCharts();
-
-const rCvs = document.getElementById('masterRadar');
-const rCtx = rCvs.getContext('2d');
-let rAngle = 0;
-let radarBlips = [];
-
-function drawMasterRadar() {
-  rCtx.clearRect(0,0,220,220);
-  const cx = 110, cy = 110, r = 96;
-
-  rCtx.strokeStyle = 'rgba(0, 240, 255, 0.4)';
-  rCtx.lineWidth = 1;
-  for(let i=1; i<=3; i++) {
-    rCtx.beginPath();
-    rCtx.arc(cx, cy, (r/3)*i, 0, Math.PI*2);
-    rCtx.stroke();
-  }
-
-  rCtx.beginPath();
-  rCtx.moveTo(cx, cy - r); rCtx.lineTo(cx, cy + r);
-  rCtx.moveTo(cx - r, cy); rCtx.lineTo(cx + r, cy);
-  rCtx.strokeStyle = 'rgba(255, 0, 119, 0.3)';
-  rCtx.stroke();
-
-  rCtx.save();
-  rCtx.translate(cx, cy);
-  rCtx.rotate(rAngle);
-  rCtx.beginPath();
-  rCtx.moveTo(0,0);
-  rCtx.arc(0,0,r,0,Math.PI/3.5);
-  rCtx.fillStyle = 'rgba(0, 240, 255, 0.22)';
-  rCtx.fill();
-  rCtx.restore();
-
-  radarBlips.forEach(b => {
-    rCtx.beginPath();
-    rCtx.arc(b.x, b.y, b.size, 0, Math.PI*2);
-    rCtx.fillStyle = b.color;
-    rCtx.shadowColor = b.color;
-    rCtx.shadowBlur = 8;
-    rCtx.fill();
-    rCtx.shadowBlur = 0;
-    rCtx.fillStyle = '#fff';
-    rCtx.font = '8px "JetBrains Mono"';
-    rCtx.fillText(b.name, b.x + 5, b.y + 3);
-  });
-
-  rAngle += 0.04;
-  requestAnimationFrame(drawMasterRadar);
-}
-drawMasterRadar();
-
-setInterval(()=>{
-  fetch('/api/status').then(r=>r.json()).then(d=>{
-    isLiveTrading = d.live_mode;
-    const b = document.getElementById('mode-toggle');
-    b.className = isLiveTrading ? "mode-badge mode-live" : "mode-badge mode-demo";
-    b.innerText = isLiveTrading ? "LIVE TRADING" : "DEMO MODE";
-
-    const curBal = isLiveTrading ? d.live_balance : d.demo_balance;
-    document.getElementById('v-bal').innerText = '$' + curBal.toFixed(2);
-
-    const pnl = d.realized_pnl;
-    const allEl = document.getElementById('v-all-pnl');
-    allEl.innerText = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
-    allEl.style.color = pnl >= 0 ? "var(--green)" : "var(--red)";
-
-    const p1El = document.getElementById('v-1h-pnl');
-    p1El.innerText = (d.pnl_1h >= 0 ? '+$' : '-$') + Math.abs(d.pnl_1h).toFixed(2);
-    p1El.style.color = d.pnl_1h >= 0 ? "var(--green)" : "var(--red)";
-    document.getElementById('v-1h-tr').innerText = d.trades_1h + "টি ট্রেড";
-
-    const p24El = document.getElementById('v-24h-pnl');
-    p24El.innerText = (d.pnl_24h >= 0 ? '+$' : '-$') + Math.abs(d.pnl_24h).toFixed(2);
-    p24El.style.color = d.pnl_24h >= 0 ? "var(--green)" : "var(--red)";
-    document.getElementById('v-24h-tr').innerText = d.trades_24h + "টি ট্রেড";
-
-    document.getElementById('v-tot-buy').innerText = d.total_buys + " BUY";
-    document.getElementById('v-tot-sell').innerText = d.total_sells + " SELL";
-
-    const winRate = d.total_sells > 0 ? ((d.wins / d.total_sells) * 100).toFixed(1) : "0";
-    document.getElementById('v-winrate').innerText = winRate + '%';
-
-    let hudHtml = '';
-    let newBlips = [];
-    const symList = Object.keys(d.markets);
-
-    symList.forEach((sym, idx) => {
-      const m = d.markets[sym];
-      const pEl = document.getElementById('tab-price-' + sym);
-      if(pEl) pEl.innerText = '$' + (m.price >= 1 ? m.price.toFixed(2) : m.price.toFixed(4));
-
-      const ords = m.dca_orders || [];
-      const inTrade = ords.length > 0;
-
-      const sEl = document.getElementById('tab-st-' + sym);
-      if(sEl) {
-        sEl.innerText = inTrade ? "TRADING" : (m.running ? "ACTIVE" : "OFF");
-        sEl.style.color = inTrade ? "var(--cyan)" : (m.running ? "var(--green)" : "var(--text-dim)");
-      }
-      const dcaEl = document.getElementById('tab-dca-' + sym);
-      if(dcaEl) dcaEl.innerText = 'DCA: ' + ords.length + '/3';
-
-      const a = (idx / symList.length) * Math.PI * 2;
-      const dist = 32 + (idx % 3) * 26;
-      newBlips.push({
-        x: 110 + Math.cos(a) * dist,
-        y: 110 + Math.sin(a) * dist,
-        size: inTrade ? 4.5 : 3,
-        color: inTrade ? '#00ff66' : '#00f0ff',
-        name: sym.replace('USDT','')
-      });
-
-      hudHtml += `<div class="hud-coin-card ${inTrade ? 'buy-pulse' : ''}">
-        <div style="font-size:10px; font-weight:800; color:var(--cyan);">${sym.replace('USDT','')}</div>
-        <div style="font-size:10px; color:#fff; margin:2px 0;">$${m.price < 1 ? m.price.toFixed(4) : m.price.toFixed(2)}</div>
-        <div style="font-size:8px; color:${inTrade ? 'var(--green)' : 'var(--text-dim)'};">${inTrade ? 'DCA ('+ords.length+'/3)' : 'STANDBY'}</div>
-      </div>`;
-    });
-
-    radarBlips = newBlips;
-    document.getElementById('hudGrid').innerHTML = hudHtml;
-
-    if (d.last_radar_event && (Date.now()/1000 - d.last_radar_event.time < 4)) {
-      document.getElementById('radarEventText').innerHTML = `TARGET: <b style="color:${d.last_radar_event.type==='BUY'?'var(--green)':'var(--red)'}">${d.last_radar_event.type} ${d.last_radar_event.symbol}</b>`;
-    }
-
-    const cur = d.markets[activeSymbol];
-    if(cur) {
-      document.getElementById('buy-pct').innerText = cur.buyer_ratio + '%';
-      document.getElementById('sell-pct').innerText = (100 - cur.buyer_ratio).toFixed(1) + '%';
-      document.getElementById('buy-bar').style.width = cur.buyer_ratio + '%';
-
-      const pTag = document.getElementById('active-pnl-label');
-      const curOrds = cur.dca_orders || [];
-      if(curOrds.length > 0) {
-        const sign = cur.unrealized_pnl >= 0 ? '+' : '';
-        pTag.innerText = `DCA (${curOrds.length}x): ${sign}${cur.unrealized_pnl}%`;
-        pTag.style.color = cur.unrealized_pnl >= 0 ? "var(--green)" : "var(--red)";
-      } else {
-        pTag.innerText = "ওপেন ট্রেড: নাই";
-        pTag.style.color = "var(--text-dim)";
-      }
-
-      const pwr = document.getElementById('pwr-btn');
-      pwr.className = cur.running ? "btn btn-off" : "btn btn-on";
-      pwr.innerText = cur.running ? "বন্ধ করুন (" + activeSymbol.replace('USDT','') + ")" : "চালু করুন (" + activeSymbol.replace('USDT','') + ")";
-
-      if(cur.price > 0) {
-        const tick = {time: Math.floor(Date.now()/1000), open: cur.price, high: cur.price, low: cur.price, close: cur.price};
-        if(curChartType === 'candlestick' || curChartType === 'bar') series.update(tick);
-        else series.update({time: tick.time, value: cur.price});
-      }
-
-      document.getElementById('bids-list').innerHTML = cur.bids.map(b=>`<tr><td style="color:var(--green)">$${(+b[0]).toFixed(b[0]>=1?2:4)}</td><td>${(+b[1]).toFixed(2)}</td></tr>`).join('');
-      document.getElementById('asks-list').innerHTML = cur.asks.map(a=>`<tr><td style="color:var(--red)">$${(+a[0]).toFixed(a[0]>=1?2:4)}</td><td>${(+a[1]).toFixed(2)}</td></tr>`).join('');
-    }
-
-    document.getElementById('logs').innerHTML = d.logs.map(l=>`<div>${l}</div>`).join('');
-    document.getElementById('hist').innerHTML = d.history.map(h=>`<tr><td>${h.time}</td><td style="color:var(--cyan);font-weight:bold">${h.symbol.replace('USDT','')}</td><td style="color:${h.side.includes('BUY')?'var(--green)':'var(--red)'}">${h.side}</td><td>${h.pnl}%</td></tr>`).join('');
-
-    const an = d.analytics;
-    if(an) {
-      let coinRows = '';
-      for (const [sym, cst] of Object.entries(an.coin_stats)) {
-        const col = cst.profit >= 0 ? 'var(--green)' : 'var(--red)';
-        const sign = cst.profit >= 0 ? '+$' : '-$';
-        coinRows += `<tr>
-          <td style="color:var(--cyan); font-weight:bold;">${sym.replace('USDT','')}</td>
-          <td>${cst.trades}টি</td>
-          <td style="color:${col}; font-weight:bold;">${sign}${Math.abs(cst.profit).toFixed(2)}</td>
-        </tr>`;
-      }
-      document.getElementById('coin-stats-body').innerHTML = coinRows;
-
-      if(hourlyChartInstance && an.hourly_chart && an.hourly_chart.labels.length > 0) {
-        hourlyChartInstance.data.labels = an.hourly_chart.labels;
-        hourlyChartInstance.data.datasets[0].data = an.hourly_chart.data;
-        hourlyChartInstance.update('none');
-      }
-      if(dailyChartInstance && an.daily_chart && an.daily_chart.labels.length > 0) {
-        dailyChartInstance.data.labels = an.daily_chart.labels;
-        dailyChartInstance.data.datasets[0].data = an.daily_chart.data;
-        dailyChartInstance.update('none');
-      }
-    }
-  });
-}, 1500);
+setInterval(refresh,3000);
+refresh();
 </script>
 </body>
 </html>"""
 
-class ReusableThreadingServer(ThreadingHTTPServer):
-    allow_reuse_address = True
 
-class CompleteRouter(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ['/', '/index.html']:
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(HTML_PAGE.encode('utf-8'))
-        elif self.path == '/api/status':
-            with lock:
-                res = {
-                    "live_mode": bot["live_mode"],
-                    "demo_balance": bot["demo_balance"],
-                    "live_balance": bot["live_balance"],
-                    "total_buys": bot["total_buys"],
-                    "total_sells": bot["total_sells"],
-                    "wins": bot["wins"],
-                    "realized_pnl": bot["realized_pnl"],
-                    "pnl_1h": bot["pnl_1h"],
-                    "pnl_24h": bot["pnl_24h"],
-                    "trades_1h": bot["trades_1h"],
-                    "trades_24h": bot["trades_24h"],
-                    "history": list(bot["history"]),
-                    "logs": list(bot["logs"]),
-                    "markets": bot["markets"],
-                    "analytics": get_analytics_metrics(),
-                    "last_radar_event": bot["last_radar_event"]
-                }
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(res).encode('utf-8'))
-        elif self.path.startswith('/api/klines'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
-            with lock:
-                klines = bot["klines_cache"].get(sym, [])
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(klines).encode('utf-8'))
+@APP.get("/")
+def dashboard():
+    return render_template_string(HTML)
 
-    def do_POST(self):
-        if self.path.startswith('/api/instant_buy'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
-            with lock:
-                if sym in bot["markets"]:
-                    m = bot["markets"][sym]
-                    p = m["price"]
-                    amt = m["amount"]
-                    m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
-                    m["position"] = {"buy_price": p, "amount": amt}
-                    m["unrealized_pnl"] = 0.0
-                    bot["total_buys"] += 1
-                    bot["last_radar_event"] = {"symbol": sym, "type": "BUY", "time": time.time()}
-                    save_state()
-                    add_log(f"[{sym}] ম্যানুয়াল বাই @ ${p:.2f}")
-                    send_telegram(f"⚡ *[MANUAL BUY]* {sym}\nPrice: `${p:.4f}`\nAmount: `${m['amount']}`")
-                    log_trade_db(sym, "BUY", p, 0.0, 0.0, "Manual Test")
-                    bot["history"].appendleft({
-                        "time": time.strftime("%H:%M:%S"),
-                        "symbol": sym,
-                        "side": "BUY",
-                        "price": round(p, 4),
-                        "pnl": 0.0
-                    })
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
 
-        elif self.path.startswith('/api/instant_sell'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
-            with lock:
-                if sym in bot["markets"]:
-                    m = bot["markets"][sym]
-                    orders = m["dca_orders"]
-                    if len(orders) > 0:
-                        p = m["price"]
-                        total_qty = sum(o["qty"] for o in orders)
-                        total_cost = sum(o["cost"] for o in orders)
-                        revenue = total_qty * p
-                        profit = revenue - total_cost
-                        diff = ((p - (total_cost / total_qty)) / (total_cost / total_qty)) * 100
-                        bot["demo_balance"] += profit
-                        bot["realized_pnl"] += profit
-                        bot["pnl_1h"] += profit
-                        bot["pnl_24h"] += profit
-                        bot["total_sells"] += 1
-                        bot["trades_1h"] += 1
-                        bot["trades_24h"] += 1
-                        if profit > 0:
-                            bot["wins"] += 1
-                        save_state()
+@APP.get("/api/state")
+def api_state():
+    with lock:
+        snapshot = {
+            k: v for k, v in state.items()
+            if k != "symbols"
+        }
+        snapshot["symbols"] = {
+            k: dict(v) for k, v in state["symbols"].items()
+        }
 
-                        bot["last_radar_event"] = {"symbol": sym, "type": "SELL", "time": time.time()}
-                        add_log(f"[{sym}] ম্যানুয়াল ক্লোজ ({len(orders)}x DCA): {profit:+.2f}$ ({diff:+.2f}%)")
-                        send_telegram(f"🏁 *[MANUAL CLOSE]* {sym}\nPrice: `${p:.4f}`\nPnL: `{diff:+.2f}%` (`{profit:+.2f}$`)")
-                        log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Close")
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": sym,
-                            "side": "SELL",
-                            "price": round(p, 4),
-                            "pnl": round(diff, 2)
-                        })
-                        m["dca_orders"] = []
-                        m["position"] = None
-                        m["unrealized_pnl"] = 0.0
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+    return jsonify({
+        "state": snapshot,
+        "positions": positions(),
+        "history": history()
+    })
 
-        elif self.path.startswith('/api/toggle_no_loss'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            val = True
-            if len(query) > 1:
-                params = urllib.parse.parse_qs(query[1])
-                sym = params.get("symbol", ["BTCUSDT"])[0]
-                val = params.get("val", ["true"])[0].lower() == "true"
-            with lock:
-                if sym in bot["markets"]:
-                    bot["markets"][sym]["no_loss_mode"] = val
-                    st_str = "অন" if val else "অফ"
-                    add_log(f"[{sym}] নো-লস মোড {st_str}")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
 
-        elif self.path == '/api/save_keys':
-            sz = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(sz).decode('utf-8'))
-            k = data.get("key", "").strip()
-            s = data.get("secret", "").strip()
-            save_config(k, s)
-            add_log("API Key ভল্টে সংরক্ষিত হয়েছে")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+@APP.post("/api/settings")
+def api_settings():
+    data = request.get_json(silent=True) or {}
 
-        elif self.path == '/api/delete_keys':
-            delete_config()
-            add_log("API Key ভল্ট থেকে মুছে ফেলা হয়েছে")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+    try:
+        amount = float(data.get("trade_usdt", state["trade_usdt"]))
+        sl = float(data.get("sl", state["sl"]))
+        tp = float(data.get("tp", state["tp"]))
+        maxpos = int(data.get("maxpos", state["maxpos"]))
+        poll = int(data.get("poll", state["poll"]))
 
-        elif self.path == '/api/toggle_mode':
-            with lock:
-                bot["live_mode"] = not bot["live_mode"]
-                mode = "LIVE" if bot["live_mode"] else "DEMO"
-                add_log(f"ট্রেডিং মোড: {mode}")
-                res = {"live_mode": bot["live_mode"]}
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(res).encode('utf-8'))
+        if not 5 <= amount <= 100000:
+            raise ValueError("Trade size 5–100000 USDT হতে হবে")
+        if not 0.1 <= sl <= 50:
+            raise ValueError("Stop Loss 0.1–50% হতে হবে")
+        if not 0.1 <= tp <= 100:
+            raise ValueError("Take Profit 0.1–100% হতে হবে")
+        if not 1 <= maxpos <= len(SYMBOLS):
+            raise ValueError("Max positions 1–8 হতে হবে")
+        if not 5 <= poll <= 300:
+            raise ValueError("Poll interval 5–300 seconds হতে হবে")
 
-        elif self.path == '/api/test_tg':
-            send_telegram("🔔 [TEST MESSAGE] Telegram Connection Verified Successfully.")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+        with lock:
+            state.update(
+                trade_usdt=amount,
+                sl=sl,
+                tp=tp,
+                maxpos=maxpos,
+                poll=poll,
+                no_loss=bool(data.get("no_loss", state["no_loss"])),
+                strategy=bool(data.get("strategy", state["strategy"]))
+            )
 
-        elif self.path.startswith('/api/toggle'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
-            with lock:
-                if sym in bot["markets"]:
-                    bot["markets"][sym]["running"] = not bot["markets"][sym]["running"]
-                    state = "চালু" if bot["markets"][sym]["running"] else "বন্ধ"
-                    add_log(f"{sym} {state}")
-                    res = {"running": bot["markets"][sym]["running"]}
-                else:
-                    res = {"running": False}
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(res).encode('utf-8'))
+        return jsonify({"ok": True, "message": "Settings saved"})
 
-        elif self.path == '/api/settings':
-            sz = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(sz).decode('utf-8'))
-            sym = data.get("symbol", "BTCUSDT")
-            with lock:
-                if sym in bot["markets"]:
-                    m = bot["markets"][sym]
-                    m["amount"] = float(data.get("amount", m["amount"]))
-                    m["stop_loss"] = float(data.get("stop_loss", m["stop_loss"]))
-                    m["take_profit"] = float(data.get("take_profit", m["take_profit"]))
-                    if "no_loss_mode" in data:
-                        m["no_loss_mode"] = bool(data["no_loss_mode"])
-                    add_log(f"[{sym}] সেটিংস সংরক্ষিত: TP={m['take_profit']}%, SL={m['stop_loss']}%")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
-    def log_message(self, *a):
-        return
 
-def run_server():
-    global PORT
-    print(f"\n==========================================")
-    print(f"Cyberpunk Ultra Terminal + Tactical Radar Active.")
-    print(f"Listening on port {PORT}")
-    print(f"==========================================\n")
-    srv = ReusableThreadingServer((HOST, PORT), CompleteRouter)
-    srv.serve_forever()
+@APP.post("/api/symbol")
+def api_symbol():
+    data = request.get_json(silent=True) or {}
+    symbol = data.get("symbol")
+
+    if symbol not in SYMBOLS:
+        return jsonify({"ok": False, "error": "Invalid symbol"}), 400
+
+    with lock:
+        state["symbols"][symbol]["enabled"] = bool(data.get("enabled"))
+
+    return jsonify({"ok": True})
+
+
+@APP.post("/api/live")
+def api_live():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+
+    if not enabled:
+        with lock:
+            state["live"] = False
+
+        telegram("LIVE mode disabled. New live orders are blocked.")
+
+        return jsonify({
+            "ok": True,
+            "live": False,
+            "message": "LIVE mode বন্ধ"
+        })
+
+    try:
+        if not bn.key or not bn.secret:
+            raise RuntimeError("Binance API Key/Secret সেট করো")
+
+        account = bn.account()
+
+        if not account.get("canTrade", False):
+            raise RuntimeError("Binance API account trading অনুমোদন করছে না")
+
+        bn.load_filters()
+
+        with lock:
+            state["live"] = True
+            state["error"] = ""
+
+        telegram("LIVE TRADING ENABLED. Real orders may use real funds.")
+
+        return jsonify({
+            "ok": True,
+            "live": True,
+            "message": "LIVE চালু"
+        })
+
+    except Exception as e:
+        with lock:
+            state["live"] = False
+            state["error"] = str(e)[:300]
+
+        return jsonify({
+            "ok": False,
+            "live": False,
+            "error": str(e)
+        }), 400
+
+
+@APP.post("/api/start")
+def api_start():
+    with lock:
+        state["running"] = True
+
+    telegram(
+        "Bot started in " +
+        ("LIVE" if state["live"] else "DEMO") +
+        " mode"
+    )
+
+    return jsonify({"ok": True})
+
+
+@APP.post("/api/stop")
+def api_stop():
+    with lock:
+        state["running"] = False
+
+    telegram("Bot stopped. Automatic strategy paused.")
+
+    return jsonify({"ok": True})
+
+
+@APP.post("/api/buy")
+def api_buy():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        return jsonify({
+            "ok": True,
+            "result": buy_symbol(data.get("symbol"), "Manual buy")
+        })
+
+    except Exception as e:
+        log.exception("Buy failed")
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@APP.post("/api/sell")
+def api_sell():
+    data = request.get_json(silent=True) or {}
+    symbol = data.get("symbol")
+
+    if symbol not in SYMBOLS:
+        return jsonify({"ok": False, "error": "Invalid symbol"}), 400
+
+    try:
+        return jsonify(
+            sell_position(symbol, bn.price(symbol), "Manual sell")
+        )
+
+    except Exception as e:
+        log.exception("Sell failed")
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@APP.post("/api/test-telegram")
+def api_test_telegram():
+    ok = telegram("Crypto Bot Pro Telegram test")
+
+    return jsonify({
+        "ok": ok,
+        "message": "Message sent" if ok else "Telegram credentials যাচাই করো"
+    }), (200 if ok else 400)
+
+
+@APP.post("/api/check-api")
+def api_check_api():
+    try:
+        result = bn.account()
+
+        return jsonify({
+            "ok": True,
+            "canTrade": result.get("canTrade"),
+            "canWithdraw": result.get("canWithdraw")
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
 
 if __name__ == "__main__":
-    run_server()
+    init_db()
+
+    try:
+        bn.load_filters()
+    except Exception as e:
+        log.warning("Exchange filters unavailable at startup: %s", e)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    print(f"Crypto Bot Pro dashboard: http://{HOST}:{PORT}")
+    print("LIVE mode OFF at startup.")
+
+    APP.run(host=HOST, port=PORT, debug=False, use_reloader=False)
