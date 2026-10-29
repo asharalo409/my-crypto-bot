@@ -53,10 +53,13 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    urls = ["https://api.binance.com/api/v3/time", "https://data-api.binance.vision/api/v3/time", "https://api1.binance.com/api/v3/time"]
+    urls = [
+        "https://data-api.binance.vision/api/v3/time",
+        "https://api.binance.com/api/v3/time"
+    ]
     for ep in urls:
         try:
-            req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
                 time_offset = data["serverTime"] - int(time.time() * 1000)
@@ -69,7 +72,7 @@ sync_binance_time()
 def binance_signed_request(endpoint, method="GET", params=None):
     global time_offset
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key ফাঁকা"
+        return None, "API Key পাওয়া যায়নি"
     try:
         if params is None:
             params = {}
@@ -79,21 +82,18 @@ def binance_signed_request(endpoint, method="GET", params=None):
         query_string = urllib.parse.urlencode(params)
         signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
         
-        urls = ["https://api.binance.com", "https://api1.binance.com", "https://api3.binance.com"]
-        for base in urls:
-            try:
-                full_url = f"{base}{endpoint}?{query_string}&signature={signature}"
-                req = urllib.request.Request(full_url, method=method)
-                req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
-                req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    return json.loads(resp.read().decode()), None
-            except urllib.error.HTTPError as e:
-                err_data = json.loads(e.read().decode())
-                return None, f"Binance {e.code}: {err_data.get('msg', 'Error')}"
-            except Exception:
-                continue
-        return None, "কানেকশন টাইমআউট"
+        full_url = f"https://api.binance.com{endpoint}?{query_string}&signature={signature}"
+        req = urllib.request.Request(full_url, method=method)
+        req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            return json.loads(resp.read().decode()), None
+    except urllib.error.HTTPError as e:
+        try:
+            err_data = json.loads(e.read().decode())
+            return None, f"Binance {e.code}: {err_data.get('msg', 'Error')}"
+        except Exception:
+            return None, f"HTTP Error {e.code}"
     except Exception as ex:
         return None, str(ex)
 
@@ -105,7 +105,7 @@ def get_live_balance():
         for b in res["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"]), None
-    return 0.0, "USDT নেই"
+    return 0.0, "USDT Asset পাওয়া যায়নি"
 
 def execute_binance_order(symbol, side, quote_order_qty=None, quantity=None):
     params = {"symbol": symbol, "side": side, "type": "MARKET"}
@@ -126,7 +126,7 @@ def send_telegram(message):
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode('utf-8')
             req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0"})
-            urllib.request.urlopen(req, timeout=5)
+            urllib.request.urlopen(req, timeout=4)
         except Exception:
             pass
     threading.Thread(target=_send, daemon=True).start()
@@ -182,29 +182,28 @@ def balance_sync_loop():
 
 threading.Thread(target=balance_sync_loop, daemon=True).start()
 
-def fetch_market_data(symbol):
+def fetch_safe_klines(symbol):
     endpoints = [
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
         f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
-        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
     ]
     for url in endpoints:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=3) as r:
                 return json.loads(r.read().decode())
         except Exception:
             continue
     return None
 
-def fetch_depth_data(symbol):
+def fetch_safe_depth(symbol):
     endpoints = [
-        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5",
-        f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5"
+        f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5",
+        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5"
     ]
     for url in endpoints:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=3) as r:
                 return json.loads(r.read().decode())
         except Exception:
@@ -214,9 +213,9 @@ def fetch_depth_data(symbol):
 def market_engine(symbol):
     while True:
         try:
-            klines = fetch_market_data(symbol)
+            klines = fetch_safe_klines(symbol)
             if not klines or len(klines) == 0:
-                time.sleep(2)
+                time.sleep(1.5)
                 continue
 
             price = float(klines[-1][4])
@@ -225,7 +224,7 @@ def market_engine(symbol):
                 for k in klines
             ]
 
-            depth = fetch_depth_data(symbol)
+            depth = fetch_safe_depth(symbol)
             bids = depth.get("bids", [])
             asks = depth.get("asks", [])
             tot_bids = sum(float(b[1]) for b in bids) if bids else 1.0
@@ -264,7 +263,7 @@ def market_engine(symbol):
                         orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
                         bot["total_buys"] += 1
                         m["cooldown_until"] = now + 15
-                        add_log(f"[{symbol}] 🟢 DCA বাই #{len(orders)} @ ${price:.4f}")
+                        add_log(f"[{symbol}] 🟢 DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
                         send_telegram(f"⚡ [DCA BUY #{len(orders)}] {symbol} Price: ${price:.4f}")
 
                     elif is_tp or is_sl:
@@ -325,7 +324,7 @@ def market_engine(symbol):
 
             time.sleep(1.2)
         except Exception:
-            time.sleep(2)
+            time.sleep(1.5)
 
 for sym in SYMBOLS:
     threading.Thread(target=market_engine, args=(sym,), daemon=True).start()
@@ -336,7 +335,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CYBERPUNK NEON TERMINAL</title>
-<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
 <style>
 :root {
