@@ -53,10 +53,7 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    urls = [
-        "https://data-api.binance.vision/api/v3/time",
-        "https://api.binance.com/api/v3/time"
-    ]
+    urls = ["https://data-api.binance.vision/api/v3/time", "https://api.binance.com/api/v3/time"]
     for ep in urls:
         try:
             req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
@@ -72,7 +69,7 @@ sync_binance_time()
 def binance_signed_request(endpoint, method="GET", params=None):
     global time_offset
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key পাওয়া যায়নি"
+        return None, "API Key ফাঁকা"
     try:
         if params is None:
             params = {}
@@ -143,9 +140,7 @@ bot = {
     "pnl_24h": 0.0,
     "history": deque(maxlen=30),
     "logs": deque(maxlen=25),
-    "markets": {},
-    "klines_cache": {},
-    "last_radar_event": None
+    "markets": {}
 }
 
 for sym in SYMBOLS:
@@ -153,9 +148,8 @@ for sym in SYMBOLS:
         "running": False, "price": 0.0, "buyer_ratio": 50.0,
         "amount": 10.0, "stop_loss": 50.0, "take_profit": 0.5,
         "no_loss_mode": True, "dca_orders": [], "position": None,
-        "unrealized_pnl": 0.0, "cooldown_until": 0, "bids": [], "asks": []
+        "unrealized_pnl": 0.0, "cooldown_until": 0
     }
-    bot["klines_cache"][sym] = []
 
 def add_log(msg):
     bot["logs"].appendleft(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -169,165 +163,18 @@ def balance_sync_loop():
                 with lock:
                     if err:
                         if err != last_err:
-                            add_log(f"[API লগ] {err}")
+                            add_log(f"[API ত্রুটি] {err}")
                             last_err = err
                     else:
                         bot["live_balance"] = bal
                         if last_err:
-                            add_log(f"[বাইনান্স লাইভ] ব্যালেন্স: ${bal:.2f}")
+                            add_log(f"[লাইভ ব্যালেন্স] ${bal:.2f}")
                             last_err = ""
             time.sleep(3)
         except Exception:
             time.sleep(3)
 
 threading.Thread(target=balance_sync_loop, daemon=True).start()
-
-def fetch_safe_klines(symbol):
-    endpoints = [
-        f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
-    ]
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                return json.loads(r.read().decode())
-        except Exception:
-            continue
-    return None
-
-def fetch_safe_depth(symbol):
-    endpoints = [
-        f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5",
-        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5"
-    ]
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                return json.loads(r.read().decode())
-        except Exception:
-            continue
-    return {"bids": [], "asks": []}
-
-def market_engine(symbol):
-    while True:
-        try:
-            klines = fetch_safe_klines(symbol)
-            if not klines or len(klines) == 0:
-                time.sleep(1.5)
-                continue
-
-            price = float(klines[-1][4])
-            formatted_klines = [
-                {"time": int(k[0] // 1000), "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
-                for k in klines
-            ]
-
-            depth = fetch_safe_depth(symbol)
-            bids = depth.get("bids", [])
-            asks = depth.get("asks", [])
-            tot_bids = sum(float(b[1]) for b in bids) if bids else 1.0
-            tot_asks = sum(float(a[1]) for a in asks) if asks else 1.0
-            b_ratio = round((tot_bids / (tot_bids + tot_asks)) * 100, 1)
-
-            with lock:
-                m = bot["markets"][symbol]
-                m["price"] = price
-                m["buyer_ratio"] = b_ratio
-                m["bids"] = bids
-                m["asks"] = asks
-                bot["klines_cache"][symbol] = formatted_klines
-
-                now = time.time()
-                orders = m["dca_orders"]
-
-                if len(orders) > 0:
-                    total_qty = sum(o["qty"] for o in orders)
-                    total_cost = sum(o["cost"] for o in orders)
-                    avg_price = total_cost / total_qty
-                    diff = ((price - avg_price) / avg_price) * 100
-                    m["unrealized_pnl"] = round(diff, 2)
-
-                    is_tp = (diff >= m["take_profit"])
-                    is_sl = (not m["no_loss_mode"]) and (diff <= -m["stop_loss"])
-
-                    last_buy = orders[-1]["price"]
-                    if (price <= last_buy * 0.985) and (len(orders) < 3) and (now > m["cooldown_until"]):
-                        buy_amt = m["amount"]
-                        if bot["live_mode"]:
-                            execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
-                        else:
-                            bot["demo_balance"] -= buy_amt
-
-                        orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
-                        bot["total_buys"] += 1
-                        m["cooldown_until"] = now + 15
-                        add_log(f"[{symbol}] 🟢 DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
-                        send_telegram(f"⚡ [DCA BUY #{len(orders)}] {symbol} Price: ${price:.4f}")
-
-                    elif is_tp or is_sl:
-                        revenue = total_qty * price
-                        profit = revenue - total_cost
-                        side_name = "TAKE PROFIT" if diff > 0 else "STOP LOSS"
-
-                        if bot["live_mode"]:
-                            execute_binance_order(symbol, "SELL", quantity=total_qty)
-                        else:
-                            bot["demo_balance"] += (total_cost + profit)
-
-                        bot["realized_pnl"] += profit
-                        bot["total_sells"] += 1
-                        if profit > 0:
-                            bot["wins"] += 1
-
-                        add_log(f"[{symbol}] 🔴 {side_name}: {profit:+.2f}$ ({diff:+.2f}%)")
-                        send_telegram(f"🎯 [{side_name}] {symbol} Exit: ${price:.4f} PnL: {diff:+.2f}%")
-                        log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), side_name)
-                        
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": symbol,
-                            "side": f"SELL({len(orders)}x)",
-                            "price": round(price, 4),
-                            "pnl": round(diff, 2)
-                        })
-                        m["dca_orders"] = []
-                        m["position"] = None
-                        m["unrealized_pnl"] = 0.0
-                        m["cooldown_until"] = now + 10
-
-                    m["position"] = {"buy_price": avg_price, "amount": total_cost} if len(orders) > 0 else None
-
-                elif m["running"]:
-                    active_pos = sum(1 for k in bot["markets"].values() if len(k["dca_orders"]) > 0)
-                    if (now > m["cooldown_until"]) and (active_pos < MAX_OPEN_POSITIONS):
-                        buy_amt = m["amount"]
-                        if bot["live_mode"]:
-                            execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
-                        else:
-                            bot["demo_balance"] -= buy_amt
-
-                        m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
-                        m["position"] = {"buy_price": price, "amount": buy_amt}
-                        bot["total_buys"] += 1
-                        add_log(f"[{symbol}] 🟢 বেস বাই @ ${price:.4f}")
-                        send_telegram(f"⚡ [BASE BUY] {symbol} Price: ${price:.4f}")
-                        log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Base Entry")
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": symbol,
-                            "side": "BUY",
-                            "price": round(price, 4),
-                            "pnl": 0.0
-                        })
-
-            time.sleep(1.2)
-        except Exception:
-            time.sleep(1.5)
-
-for sym in SYMBOLS:
-    threading.Thread(target=market_engine, args=(sym,), daemon=True).start()
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="bn" data-theme="cyberpunk">
@@ -545,7 +392,10 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 <script>
 let activeSymbol = "BTCUSDT";
+let currentPrice = 0;
 let chartEl = document.getElementById('chart');
+const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"];
+let localPrices = {};
 
 function applyTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
@@ -575,7 +425,7 @@ function selectMarket(sym, tabEl) {
   tabEl.classList.add('active');
   document.getElementById('chart-sym').innerText = sym;
   document.getElementById('cfg-sym').innerText = sym;
-  loadChartData(sym);
+  loadDirectBinanceKlines(sym);
   updateActiveControls();
 }
 
@@ -605,17 +455,96 @@ const ch = LightweightCharts.createChart(chartEl, {
 });
 let series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
 
-function loadChartData(sym) {
-  fetch('/api/klines?symbol=' + sym)
+// ব্রাউজার থেকেই সরাসরি বাইন্যান্স থেকে ডেটা ফেচিং (কোনো আইপি ব্লক হবে না)
+function loadDirectBinanceKlines(sym) {
+  fetch('https://api.binance.com/api/v3/klines?symbol=' + sym + '&interval=1m&limit=40')
+    .then(r => r.json())
+    .then(klines => {
+      if(klines && Array.isArray(klines)) {
+        const formatted = klines.map(k => ({
+          time: Math.floor(k[0] / 1000),
+          open: parseFloat(k[1]),
+          high: parseFloat(k[2]),
+          low: parseFloat(k[3]),
+          close: parseFloat(k[4])
+        }));
+        series.setData(formatted);
+        ch.timeScale().fitContent();
+        if(formatted.length > 0) {
+          currentPrice = formatted[formatted.length - 1].close;
+          syncPriceToServer(sym, currentPrice);
+        }
+      }
+    }).catch(err => {
+      // ব্যাকআপ পাবলিক প্রক্সি
+      fetch('https://data-api.binance.vision/api/v3/klines?symbol=' + sym + '&interval=1m&limit=40')
+        .then(r => r.json())
+        .then(klines => {
+          const formatted = klines.map(k => ({
+            time: Math.floor(k[0] / 1000),
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4])
+          }));
+          series.setData(formatted);
+          ch.timeScale().fitContent();
+        });
+    });
+}
+loadDirectBinanceKlines("BTCUSDT");
+
+function syncPriceToServer(sym, price) {
+  fetch('/api/sync_price', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({symbol: sym, price: price})
+  });
+}
+
+// সকল কয়েনের প্রাইস ব্রাউজার থেকেই সেকেন্ডে আনা
+function fetchAllPricesDirect() {
+  fetch('https://api.binance.com/api/v3/ticker/price')
+    .then(r => r.json())
+    .then(data => {
+      if(Array.isArray(data)) {
+        data.forEach(item => {
+          if(SYMBOLS.includes(item.symbol)) {
+            const p = parseFloat(item.price);
+            localPrices[item.symbol] = p;
+            const el = document.getElementById('tab-price-' + item.symbol);
+            if(el) el.innerText = '$' + (p >= 1 ? p.toFixed(2) : p.toFixed(4));
+            if(item.symbol === activeSymbol) {
+              currentPrice = p;
+              series.update({
+                time: Math.floor(Date.now() / 1000),
+                open: p, high: p, low: p, close: p
+              });
+            }
+          }
+        });
+        updateRadarDisplay();
+      }
+    });
+
+  // অর্ডারবুক ফেচ
+  fetch('https://api.binance.com/api/v3/depth?symbol=' + activeSymbol + '&limit=5')
     .then(r => r.json())
     .then(d => {
-      if(d && d.length > 0) {
-        series.setData(d);
-        ch.timeScale().fitContent();
+      if(d.bids && d.asks) {
+        const totBids = d.bids.reduce((a,b)=>a+parseFloat(b[1]), 0);
+        const totAsks = d.asks.reduce((a,b)=>a+parseFloat(b[1]), 0);
+        const bRatio = ((totBids / (totBids + totAsks)) * 100).toFixed(1);
+        document.getElementById('buy-pct').innerText = bRatio + '%';
+        document.getElementById('sell-pct').innerText = (100 - bRatio).toFixed(1) + '%';
+        document.getElementById('buy-bar').style.width = bRatio + '%';
+
+        document.getElementById('bids-list').innerHTML = d.bids.map(b=>`<tr><td style="color:var(--green)">$${(+b[0]).toFixed(b[0]>=1?2:4)}</td><td>${(+b[1]).toFixed(2)}</td></tr>`).join('');
+        document.getElementById('asks-list').innerHTML = d.asks.map(a=>`<tr><td style="color:var(--red)">$${(+a[0]).toFixed(a[0]>=1?2:4)}</td><td>${(+a[1]).toFixed(2)}</td></tr>`).join('');
       }
     }).catch(e=>{});
 }
-loadChartData("BTCUSDT");
+setInterval(fetchAllPricesDirect, 1200);
 
 function toggleCurrentMarket(e) {
   if(e) e.preventDefault();
@@ -626,8 +555,14 @@ function toggleCurrentMarket(e) {
   });
 }
 
-function instantBuy(e) { if(e) e.preventDefault(); fetch('/api/instant_buy?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}); }
-function instantSell(e) { if(e) e.preventDefault(); fetch('/api/instant_sell?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}); }
+function instantBuy(e) { 
+  if(e) e.preventDefault(); 
+  fetch('/api/instant_buy?symbol=' + encodeURIComponent(activeSymbol) + '&price=' + currentPrice, {method:'POST'}); 
+}
+function instantSell(e) { 
+  if(e) e.preventDefault(); 
+  fetch('/api/instant_sell?symbol=' + encodeURIComponent(activeSymbol) + '&price=' + currentPrice, {method:'POST'}); 
+}
 
 function saveCurrentConfig(e) {
   if(e) e.preventDefault();
@@ -684,6 +619,30 @@ function drawMasterRadar() {
 }
 drawMasterRadar();
 
+function updateRadarDisplay() {
+  let hudHtml = '';
+  let newBlips = [];
+  SYMBOLS.forEach((sym, idx) => {
+    const p = localPrices[sym] || 0;
+    const a = (idx / SYMBOLS.length) * Math.PI * 2;
+    const dist = 28 + (idx % 3) * 22;
+    newBlips.push({
+      x: 100 + Math.cos(a) * dist,
+      y: 100 + Math.sin(a) * dist,
+      size: 3.5,
+      color: '#00f0ff',
+      name: sym.replace('USDT','')
+    });
+    hudHtml += `<div class="hud-coin-card">
+      <div style="font-size:10px; font-weight:800; color:var(--cyan);">${sym.replace('USDT','')}</div>
+      <div style="font-size:10px; color:inherit; margin:2px 0;">$${p < 1 ? p.toFixed(4) : p.toFixed(2)}</div>
+      <div style="font-size:8px; color:var(--text-dim);">STANDBY</div>
+    </div>`;
+  });
+  radarBlips = newBlips;
+  document.getElementById('hudGrid').innerHTML = hudHtml;
+}
+
 setInterval(()=>{
   fetch('/api/status').then(r=>r.json()).then(d=>{
     const b = document.getElementById('mode-toggle');
@@ -708,52 +667,8 @@ setInterval(()=>{
     const winRate = d.total_sells > 0 ? ((d.wins / d.total_sells) * 100).toFixed(1) : "0";
     document.getElementById('v-winrate').innerText = winRate + '%';
 
-    let hudHtml = '';
-    let newBlips = [];
-    const symList = Object.keys(d.markets);
-
-    symList.forEach((sym, idx) => {
-      const m = d.markets[sym];
-      const pEl = document.getElementById('tab-price-' + sym);
-      if(pEl) pEl.innerText = '$' + (m.price >= 1 ? m.price.toFixed(2) : m.price.toFixed(4));
-      
-      const ords = m.dca_orders || [];
-      const inTrade = ords.length > 0;
-
-      const sEl = document.getElementById('tab-st-' + sym);
-      if(sEl) {
-        sEl.innerText = inTrade ? "TRADING" : (m.running ? "ACTIVE" : "OFF");
-        sEl.style.color = inTrade ? "var(--cyan)" : (m.running ? "var(--green)" : "var(--text-dim)");
-      }
-      const dcaEl = document.getElementById('tab-dca-' + sym);
-      if(dcaEl) dcaEl.innerText = 'DCA: ' + ords.length + '/3';
-
-      const a = (idx / symList.length) * Math.PI * 2;
-      const dist = 28 + (idx % 3) * 22;
-      newBlips.push({
-        x: 100 + Math.cos(a) * dist,
-        y: 100 + Math.sin(a) * dist,
-        size: inTrade ? 4.5 : 3,
-        color: inTrade ? '#00ff66' : '#00f0ff',
-        name: sym.replace('USDT','')
-      });
-
-      hudHtml += `<div class="hud-coin-card">
-        <div style="font-size:10px; font-weight:800; color:var(--cyan);">${sym.replace('USDT','')}</div>
-        <div style="font-size:10px; color:inherit; margin:2px 0;">$${m.price < 1 ? m.price.toFixed(4) : m.price.toFixed(2)}</div>
-        <div style="font-size:8px; color:${inTrade ? 'var(--green)' : 'var(--text-dim)'};">${inTrade ? 'DCA ('+ords.length+'/3)' : 'STANDBY'}</div>
-      </div>`;
-    });
-
-    radarBlips = newBlips;
-    document.getElementById('hudGrid').innerHTML = hudHtml;
-
     const cur = d.markets[activeSymbol];
     if(cur) {
-      document.getElementById('buy-pct').innerText = cur.buyer_ratio + '%';
-      document.getElementById('sell-pct').innerText = (100 - cur.buyer_ratio).toFixed(1) + '%';
-      document.getElementById('buy-bar').style.width = cur.buyer_ratio + '%';
-
       const pTag = document.getElementById('active-pnl-label');
       const curOrds = cur.dca_orders || [];
       if(curOrds.length > 0) {
@@ -764,13 +679,6 @@ setInterval(()=>{
         pTag.innerText = "ওপেন ট্রেড: নাই";
         pTag.style.color = "var(--text-dim)";
       }
-
-      if(cur.price > 0) {
-        series.update({time: Math.floor(Date.now()/1000), open: cur.price, high: cur.price, low: cur.price, close: cur.price});
-      }
-
-      document.getElementById('bids-list').innerHTML = cur.bids.map(b=>`<tr><td style="color:var(--green)">$${(+b[0]).toFixed(b[0]>=1?2:4)}</td><td>${(+b[1]).toFixed(2)}</td></tr>`).join('');
-      document.getElementById('asks-list').innerHTML = cur.asks.map(a=>`<tr><td style="color:var(--red)">$${(+a[0]).toFixed(a[0]>=1?2:4)}</td><td>${(+a[1]).toFixed(2)}</td></tr>`).join('');
     }
 
     document.getElementById('logs').innerHTML = d.logs.map(l=>`<div>${l}</div>`).join('');
@@ -811,28 +719,30 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(res).encode('utf-8'))
-        elif self.path.startswith('/api/klines'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
+
+    def do_POST(self):
+        if self.path == '/api/sync_price':
+            sz = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(sz).decode('utf-8'))
+            sym = data.get("symbol")
+            p = float(data.get("price", 0))
             with lock:
-                klines = bot["klines_cache"].get(sym, [])
+                if sym in bot["markets"]:
+                    bot["markets"][sym]["price"] = p
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps(klines).encode('utf-8'))
+            self.wfile.write(b'{"ok":true}')
 
-    def do_POST(self):
-        if self.path.startswith('/api/instant_buy'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
+        elif self.path.startswith('/api/instant_buy'):
+            query = urllib.parse.parse_qs(self.path.split('?')[1]) if '?' in self.path else {}
+            sym = query.get("symbol", ["BTCUSDT"])[0]
+            p = float(query.get("price", [0])[0])
             with lock:
                 if sym in bot["markets"]:
                     m = bot["markets"][sym]
-                    p = m["price"]
+                    if p <= 0:
+                        p = m["price"]
                     amt = m["amount"]
                     if bot["live_mode"]:
                         execute_binance_order(sym, "BUY", quote_order_qty=amt)
@@ -851,16 +761,16 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.wfile.write(b'{"ok":true}')
 
         elif self.path.startswith('/api/instant_sell'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
+            query = urllib.parse.parse_qs(self.path.split('?')[1]) if '?' in self.path else {}
+            sym = query.get("symbol", ["BTCUSDT"])[0]
+            p = float(query.get("price", [0])[0])
             with lock:
                 if sym in bot["markets"]:
                     m = bot["markets"][sym]
+                    if p <= 0:
+                        p = m["price"]
                     orders = m["dca_orders"]
                     if len(orders) > 0:
-                        p = m["price"]
                         total_qty = sum(o["qty"] for o in orders)
                         total_cost = sum(o["cost"] for o in orders)
                         profit = (total_qty * p) - total_cost
@@ -883,13 +793,9 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.wfile.write(b'{"ok":true}')
 
         elif self.path.startswith('/api/toggle_no_loss'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            val = True
-            if len(query) > 1:
-                params = urllib.parse.parse_qs(query[1])
-                sym = params.get("symbol", ["BTCUSDT"])[0]
-                val = params.get("val", ["true"])[0].lower() == "true"
+            query = urllib.parse.parse_qs(self.path.split('?')[1]) if '?' in self.path else {}
+            sym = query.get("symbol", ["BTCUSDT"])[0]
+            val = query.get("val", ["true"])[0].lower() == "true"
             with lock:
                 if sym in bot["markets"]:
                     bot["markets"][sym]["no_loss_mode"] = val
@@ -899,10 +805,8 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.wfile.write(b'{"ok":true}')
 
         elif self.path.startswith('/api/toggle'):
-            query = self.path.split('?')
-            sym = "BTCUSDT"
-            if len(query) > 1 and "symbol=" in query[1]:
-                sym = query[1].split('symbol=')[1].split('&')[0]
+            query = urllib.parse.parse_qs(self.path.split('?')[1]) if '?' in self.path else {}
+            sym = query.get("symbol", ["BTCUSDT"])[0]
             with lock:
                 if sym in bot["markets"]:
                     bot["markets"][sym]["running"] = not bot["markets"][sym]["running"]
