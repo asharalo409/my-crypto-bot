@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CYBERPUNK NEON TERMINAL ULTRA</title>
+<title>CYBERPUNK NEON TERMINAL</title>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
 <style>
@@ -115,7 +115,7 @@ input:checked + .slider:before { transform: translateX(16px); }
       <option value="binance">Binance Dark</option>
       <option value="oled">OLED Black</option>
     </select>
-    <div class="mode-badge mode-live" id="mode-toggle" onclick="toggleTradingMode(event)">LIVE TRADING</div>
+    <div class="mode-badge mode-demo" id="mode-toggle" onclick="toggleTradingMode(event)">DEMO MODE</div>
   </div>
 </div>
 
@@ -125,7 +125,7 @@ input:checked + .slider:before { transform: translateX(16px); }
   <div class="an-card"><div class="an-title">২৪ ঘণ্টার লাভ</div><div class="an-val mono" id="v-24h-pnl">$0.00</div></div>
   <div class="an-card"><div class="an-title">বাই / সেল</div><div class="an-val mono"><span style="color:var(--green);" id="v-tot-buy">0</span> / <span style="color:var(--red);" id="v-tot-sell">0</span></div></div>
   <div class="an-card"><div class="an-title">উইন রেট</div><div class="an-val mono" id="v-winrate" style="color:var(--cyan);">0%</div></div>
-  <div class="an-card"><div class="an-title">ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--green);">$0.00</div></div>
+  <div class="an-card"><div class="an-title">ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--cyan);">$1000.00</div></div>
 </div>
 
 <div class="market-nav">
