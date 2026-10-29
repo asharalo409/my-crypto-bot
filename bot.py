@@ -1,116 +1,26 @@
 #!/usr/bin/env python3
 import json
 import time
-import os
-import hmac
-import hashlib
 import threading
 import sqlite3
-import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 8080))
-
-CONFIG_FILE = "config.json"
-BINANCE_API_KEY = ""
-BINANCE_API_SECRET = ""
-
-def load_config():
-    global BINANCE_API_KEY, BINANCE_API_SECRET
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                data = json.load(f)
-                BINANCE_API_KEY = data.get("key", "").strip()
-                BINANCE_API_SECRET = data.get("secret", "").strip()
-        except Exception:
-            pass
-
-def save_config(key, secret):
-    global BINANCE_API_KEY, BINANCE_API_SECRET
-    BINANCE_API_KEY = key.strip()
-    BINANCE_API_SECRET = secret.strip()
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump({"key": BINANCE_API_KEY, "secret": BINANCE_API_SECRET}, f)
-    except Exception:
-        pass
-
-def delete_config():
-    global BINANCE_API_KEY, BINANCE_API_SECRET
-    BINANCE_API_KEY = ""
-    BINANCE_API_SECRET = ""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            os.remove(CONFIG_FILE)
-        except Exception:
-            pass
-
-load_config()
-
-TELEGRAM_TOKEN = "9089337002:AAFDg1eJBFuQzvEkN5FD1gVh8zk1J1WhZdo"
-TELEGRAM_CHAT_ID = "7741119923"
-
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"]
-MAX_OPEN_POSITIONS = 5
-STATE_FILE = "bot_state.json"
-DB_FILE = "trading_history.db"
-
-def load_state():
-    default_state = {
-        "demo_balance": 1000.0,
-        "total_buys": 0,
-        "total_sells": 0,
-        "wins": 0,
-        "realized_pnl": 0.0,
-        "pnl_1h": 0.0,
-        "pnl_24h": 0.0,
-        "trades_1h": 0,
-        "trades_24h": 0
-    }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-                default_state.update(data)
-        except Exception:
-            pass
-    return default_state
-
-def save_state():
-    try:
-        data = {
-            "demo_balance": bot["demo_balance"],
-            "total_buys": bot["total_buys"],
-            "total_sells": bot["total_sells"],
-            "wins": bot["wins"],
-            "realized_pnl": bot["realized_pnl"],
-            "pnl_1h": bot["pnl_1h"],
-            "pnl_24h": bot["pnl_24h"],
-            "trades_1h": bot["trades_1h"],
-            "trades_24h": bot["trades_24h"]
-        }
-        with open(STATE_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+from config import HOST, PORT, SYMBOLS, MAX_OPEN_POSITIONS, DB_FILE
+from binance_api import (
+    get_live_balance, execute_binance_order, fetch_klines,
+    fetch_depth, send_telegram
+)
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT,
-        symbol TEXT,
-        side TEXT,
-        price REAL,
-        pnl REAL,
-        profit_usd REAL,
-        reason TEXT
+        timestamp TEXT, symbol TEXT, side TEXT,
+        price REAL, pnl REAL, profit_usd REAL, reason TEXT
     )''')
     conn.commit()
     conn.close()
@@ -128,133 +38,21 @@ def log_trade_db(symbol, side, price, pnl, profit_usd, reason):
         pass
 
 init_db()
-
-def load_initial_history():
-    hist = deque(maxlen=40)
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT timestamp, symbol, side, price, pnl FROM trades ORDER BY id DESC LIMIT 20")
-        for r in c.fetchall():
-            hist.append({
-                "time": r[0].split()[1] if ' ' in r[0] else r[0],
-                "symbol": r[1],
-                "side": r[2],
-                "price": r[3],
-                "pnl": r[4]
-            })
-        conn.close()
-    except Exception:
-        pass
-    return hist
-
-time_offset = 0
-
-def sync_binance_time():
-    global time_offset
-    for ep in ["https://api.binance.com/api/v3/time", "https://api1.binance.com/api/v3/time", "https://data-api.binance.vision/api/v3/time"]:
-        try:
-            req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.loads(resp.read().decode())
-                server_time = data["serverTime"]
-                local_time = int(time.time() * 1000)
-                time_offset = server_time - local_time
-                return
-        except Exception:
-            continue
-
-sync_binance_time()
-
-def binance_signed_request(endpoint, method="GET", params=None):
-    global BINANCE_API_KEY, BINANCE_API_SECRET, time_offset
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key বা Secret প্রদান করা হয়নি"
-    try:
-        if params is None:
-            params = {}
-        sync_binance_time()
-        params["timestamp"] = int(time.time() * 1000) + time_offset
-        params["recvWindow"] = 60000
-        query_string = urllib.parse.urlencode(params)
-        signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-        
-        base_urls = ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]
-        for base in base_urls:
-            try:
-                full_url = f"{base}{endpoint}?{query_string}&signature={signature}"
-                req = urllib.request.Request(full_url, method=method)
-                req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
-                req.add_header("User-Agent", "Mozilla/5.0")
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    return json.loads(resp.read().decode()), None
-            except urllib.error.HTTPError as e:
-                try:
-                    err_data = json.loads(e.read().decode())
-                    return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
-                except Exception:
-                    return None, f"Binance Error {e.code}"
-            except Exception:
-                continue
-        return None, "API কানেকশন টাইমআউট হয়েছে"
-    except Exception as ex:
-        return None, str(ex)
-
-def get_live_balance():
-    res, err = binance_signed_request("/api/v3/account", method="GET")
-    if err:
-        return 0.0, err
-    if res and "balances" in res:
-        for b in res["balances"]:
-            if b["asset"] == "USDT":
-                return float(b["free"]), None
-    return 0.0, "USDT Asset পাওয়া যায়নি"
-
-def execute_binance_order(symbol, side, quote_order_qty=None, quantity=None):
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET"
-    }
-    if side == "BUY" and quote_order_qty:
-        params["quoteOrderQty"] = f"{quote_order_qty:.2f}"
-    elif side == "SELL":
-        if quantity:
-            params["quantity"] = f"{quantity:.5f}"
-        elif quote_order_qty:
-            params["quoteOrderQty"] = f"{quote_order_qty:.2f}"
-
-    return binance_signed_request("/api/v3/order", method="POST", params=params)
-
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    def _send():
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}).encode()
-            req = urllib.request.Request(url, data=data)
-            urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass
-    threading.Thread(target=_send, daemon=True).start()
-
 lock = threading.RLock()
-st = load_state()
 
 bot = {
-    "live_mode": False,
-    "demo_balance": st["demo_balance"],
+    "live_mode": True,  # ডিফল্টভাবে লাইভ মোড সক্রিয়
+    "demo_balance": 1000.0,
     "live_balance": 0.0,
-    "total_buys": st["total_buys"],
-    "total_sells": st["total_sells"],
-    "wins": st["wins"],
-    "realized_pnl": st["realized_pnl"],
-    "pnl_1h": st["pnl_1h"],
-    "pnl_24h": st["pnl_24h"],
-    "trades_1h": st["trades_1h"],
-    "trades_24h": st["trades_24h"],
-    "history": load_initial_history(),
+    "total_buys": 0,
+    "total_sells": 0,
+    "wins": 0,
+    "realized_pnl": 0.0,
+    "pnl_1h": 0.0,
+    "pnl_24h": 0.0,
+    "trades_1h": 0,
+    "trades_24h": 0,
+    "history": deque(maxlen=30),
     "logs": deque(maxlen=25),
     "markets": {},
     "klines_cache": {},
@@ -263,19 +61,10 @@ bot = {
 
 for sym in SYMBOLS:
     bot["markets"][sym] = {
-        "running": False,
-        "price": 0.0,
-        "buyer_ratio": 50.0,
-        "amount": 10.0,
-        "stop_loss": 50.0,
-        "take_profit": 0.5,
-        "no_loss_mode": True,
-        "dca_orders": [],
-        "position": None,
-        "unrealized_pnl": 0.0,
-        "cooldown_until": 0,
-        "bids": [],
-        "asks": []
+        "running": False, "price": 0.0, "buyer_ratio": 50.0,
+        "amount": 10.0, "stop_loss": 50.0, "take_profit": 0.5,
+        "no_loss_mode": True, "dca_orders": [], "position": None,
+        "unrealized_pnl": 0.0, "cooldown_until": 0, "bids": [], "asks": []
     }
     bot["klines_cache"][sym] = []
 
@@ -286,57 +75,27 @@ def balance_sync_loop():
     last_err = ""
     while True:
         try:
-            if bot["live_mode"] and BINANCE_API_KEY and BINANCE_API_SECRET:
-                bal, err = get_live_balance()
-                with lock:
-                    if err:
-                        if err != last_err:
-                            add_log(f"[API ব্যালেন্স ত্রুটি] {err}")
-                            last_err = err
-                    else:
-                        bot["live_balance"] = bal
-                        if last_err:
-                            add_log(f"[বাইনান্স লাইভ] ব্যালেন্স: ${bal:.2f}")
-                            last_err = ""
+            bal, err = get_live_balance()
+            with lock:
+                if err:
+                    if err != last_err:
+                        add_log(f"[API লগ] {err}")
+                        last_err = err
+                else:
+                    bot["live_balance"] = bal
+                    if last_err:
+                        add_log(f"[বাইনান্স লাইভ] ব্যালেন্স: ${bal:.2f}")
+                        last_err = ""
             time.sleep(3)
         except Exception:
             time.sleep(3)
 
 threading.Thread(target=balance_sync_loop, daemon=True).start()
 
-def fetch_market_klines(symbol):
-    endpoints = [
-        f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
-        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
-    ]
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                return json.loads(r.read().decode())
-        except Exception:
-            continue
-    return None
-
-def fetch_market_depth(symbol):
-    endpoints = [
-        f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5",
-        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5"
-    ]
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                return json.loads(r.read().decode())
-        except Exception:
-            continue
-    return {"bids": [], "asks": []}
-
 def market_engine(symbol):
     while True:
         try:
-            klines = fetch_market_klines(symbol)
+            klines = fetch_klines(symbol)
             if not klines or len(klines) == 0:
                 time.sleep(2)
                 continue
@@ -347,7 +106,7 @@ def market_engine(symbol):
                 for k in klines
             ]
 
-            depth = fetch_market_depth(symbol)
+            depth = fetch_depth(symbol)
             bids = depth.get("bids", [])
             asks = depth.get("asks", [])
             tot_bids = sum(float(b[1]) for b in bids) if bids else 1.0
@@ -379,24 +138,13 @@ def market_engine(symbol):
                     if (price <= last_buy * 0.985) and (len(orders) < 3) and (now > m["cooldown_until"]):
                         buy_amt = m["amount"]
                         if bot["live_mode"]:
-                            res, err = execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
-                            if err:
-                                add_log(f"[{symbol}] ❌ লাইভ বাই ব্যর্থ: {err}")
-                            else:
-                                orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
-                                bot["total_buys"] += 1
-                                m["cooldown_until"] = now + 15
-                                bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                                add_log(f"[{symbol}] 🟢 [LIVE] DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
-                                send_telegram(f"⚡ *[LIVE DCA BUY #{len(orders)}]* {symbol}\nPrice: `${price:.4f}`")
-                                save_state()
-                        else:
-                            orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
-                            bot["total_buys"] += 1
-                            m["cooldown_until"] = now + 15
-                            bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                            add_log(f"[{symbol}] 🟢 [DEMO] DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
-                            save_state()
+                            execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
+                        orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
+                        bot["total_buys"] += 1
+                        m["cooldown_until"] = now + 15
+                        bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
+                        add_log(f"[{symbol}] 🟢 DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
+                        threading.Thread(target=send_telegram, args=(f"⚡ [DCA BUY #{len(orders)}] {symbol} Price: ${price:.4f}",), daemon=True).start()
 
                     elif is_tp or is_sl:
                         revenue = total_qty * price
@@ -404,99 +152,53 @@ def market_engine(symbol):
                         side_name = "TAKE PROFIT" if diff > 0 else "STOP LOSS"
 
                         if bot["live_mode"]:
-                            res, err = execute_binance_order(symbol, "SELL", quantity=total_qty)
-                            if err:
-                                add_log(f"[{symbol}] ❌ লাইভ সেল ব্যর্থ: {err}")
-                            else:
-                                bot["realized_pnl"] += profit
-                                bot["pnl_1h"] += profit
-                                bot["pnl_24h"] += profit
-                                bot["total_sells"] += 1
-                                if profit > 0:
-                                    bot["wins"] += 1
-                                save_state()
-                                bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
-                                add_log(f"[{symbol}] 🔴 [LIVE] {side_name}: {profit:+.2f}$ ({diff:+.2f}%)")
-                                send_telegram(f"🎯 *[LIVE {side_name}]* {symbol}\nExit: `${price:.4f}`\nPnL: `{diff:+.2f}%`")
-                                log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), f"LIVE {side_name}")
-                                bot["history"].appendleft({
-                                    "time": time.strftime("%H:%M:%S"),
-                                    "symbol": symbol,
-                                    "side": f"SELL({len(orders)}x)",
-                                    "price": round(price, 4),
-                                    "pnl": round(diff, 2)
-                                })
-                                m["dca_orders"] = []
-                                m["position"] = None
-                                m["unrealized_pnl"] = 0.0
-                                m["cooldown_until"] = now + 10
-                        else:
-                            bot["demo_balance"] += profit
-                            bot["realized_pnl"] += profit
-                            bot["pnl_1h"] += profit
-                            bot["pnl_24h"] += profit
-                            bot["total_sells"] += 1
-                            if profit > 0:
-                                bot["wins"] += 1
-                            save_state()
-                            bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
-                            add_log(f"[{symbol}] 🔴 [DEMO] {side_name}: {profit:+.2f}$ ({diff:+.2f}%)")
-                            log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), f"DEMO {side_name}")
-                            bot["history"].appendleft({
-                                "time": time.strftime("%H:%M:%S"),
-                                "symbol": symbol,
-                                "side": f"SELL({len(orders)}x)",
-                                "price": round(price, 4),
-                                "pnl": round(diff, 2)
-                            })
-                            m["dca_orders"] = []
-                            m["position"] = None
-                            m["unrealized_pnl"] = 0.0
-                            m["cooldown_until"] = now + 10
+                            execute_binance_order(symbol, "SELL", quantity=total_qty)
+
+                        bot["realized_pnl"] += profit
+                        bot["total_sells"] += 1
+                        if profit > 0:
+                            bot["wins"] += 1
+
+                        bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
+                        add_log(f"[{symbol}] 🔴 {side_name}: {profit:+.2f}$ ({diff:+.2f}%)")
+                        threading.Thread(target=send_telegram, args=(f"🎯 [{side_name}] {symbol} Exit: ${price:.4f} PnL: {diff:+.2f}%",), daemon=True).start()
+                        log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), side_name)
+                        
+                        bot["history"].appendleft({
+                            "time": time.strftime("%H:%M:%S"),
+                            "symbol": symbol,
+                            "side": f"SELL({len(orders)}x)",
+                            "price": round(price, 4),
+                            "pnl": round(diff, 2)
+                        })
+                        m["dca_orders"] = []
+                        m["position"] = None
+                        m["unrealized_pnl"] = 0.0
+                        m["cooldown_until"] = now + 10
 
                     m["position"] = {"buy_price": avg_price, "amount": total_cost} if len(orders) > 0 else None
 
                 elif m["running"]:
-                    active_positions = sum(1 for k in bot["markets"].values() if len(k["dca_orders"]) > 0)
-                    if (now > m["cooldown_until"]) and (active_positions < MAX_OPEN_POSITIONS):
+                    active_pos = sum(1 for k in bot["markets"].values() if len(k["dca_orders"]) > 0)
+                    if (now > m["cooldown_until"]) and (active_pos < MAX_OPEN_POSITIONS):
                         buy_amt = m["amount"]
                         if bot["live_mode"]:
-                            res, err = execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
-                            if err:
-                                add_log(f"[{symbol}] ❌ লাইভ বেস বাই ব্যর্থ: {err}")
-                            else:
-                                m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
-                                m["position"] = {"buy_price": price, "amount": buy_amt}
-                                m["unrealized_pnl"] = 0.0
-                                bot["total_buys"] += 1
-                                bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                                save_state()
-                                add_log(f"[{symbol}] 🟢 [LIVE] বেস বাই @ ${price:.4f}")
-                                send_telegram(f"⚡ *[LIVE BASE BUY]* {symbol}\nPrice: `${price:.4f}`")
-                                log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Live Base")
-                                bot["history"].appendleft({
-                                    "time": time.strftime("%H:%M:%S"),
-                                    "symbol": symbol,
-                                    "side": "BUY",
-                                    "price": round(price, 4),
-                                    "pnl": 0.0
-                                })
-                        else:
-                            m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
-                            m["position"] = {"buy_price": price, "amount": buy_amt}
-                            m["unrealized_pnl"] = 0.0
-                            bot["total_buys"] += 1
-                            bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                            save_state()
-                            add_log(f"[{symbol}] 🟢 [DEMO] বেস বাই @ ${price:.4f}")
-                            log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Demo Base")
-                            bot["history"].appendleft({
-                                "time": time.strftime("%H:%M:%S"),
-                                "symbol": symbol,
-                                "side": "BUY",
-                                "price": round(price, 4),
-                                "pnl": 0.0
-                            })
+                            execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
+
+                        m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
+                        m["position"] = {"buy_price": price, "amount": buy_amt}
+                        bot["total_buys"] += 1
+                        bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
+                        add_log(f"[{symbol}] 🟢 বেস বাই @ ${price:.4f}")
+                        threading.Thread(target=send_telegram, args=(f"⚡ [BASE BUY] {symbol} Price: ${price:.4f}",), daemon=True).start()
+                        log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Base Entry")
+                        bot["history"].appendleft({
+                            "time": time.strftime("%H:%M:%S"),
+                            "symbol": symbol,
+                            "side": "BUY",
+                            "price": round(price, 4),
+                            "pnl": 0.0
+                        })
 
             time.sleep(1.2)
         except Exception:
@@ -531,13 +233,12 @@ HTML_PAGE = """<!DOCTYPE html>
 body { background-color: var(--bg); color: var(--text); padding: 8px; min-height: 100vh; }
 .mono { font-family: 'JetBrains Mono', monospace; }
 
-.header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+.header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 8px; }
 .header-left { display: flex; align-items: center; gap: 8px; }
-.profile-avatar { width: 34px; height: 34px; border-radius: 50%; border: 2px solid var(--cyan); object-fit: cover; }
 .brand { font-size: 13px; font-weight: 900; color: var(--cyan); letter-spacing: 0.5px; }
 
 select { background: var(--panel); color: var(--text); border: 1px solid var(--border-cyan); padding: 4px 6px; border-radius: 6px; font-size: 10px; }
-.mode-badge { padding: 5px 12px; border-radius: 8px; font-weight: 800; font-size: 10px; cursor: pointer; transition: 0.2s; user-select: none; }
+.mode-badge { padding: 5px 12px; border-radius: 8px; font-weight: 800; font-size: 10px; cursor: pointer; user-select: none; }
 .mode-demo { background: rgba(0, 240, 255, 0.2); color: var(--cyan); border: 1.5px solid var(--cyan); }
 .mode-live { background: rgba(255, 0, 68, 0.35); color: #fff; border: 1.5px solid var(--red); box-shadow: 0 0 10px rgba(255,0,68,0.5); }
 
@@ -562,10 +263,7 @@ select { background: var(--panel); color: var(--text); border: 1px solid var(--b
 .box { background: var(--panel); border: 1.5px solid var(--border-cyan); border-radius: 10px; padding: 10px; margin-bottom: 8px; }
 .box-head { font-size: 12px; font-weight: 800; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: var(--cyan); }
 
-#chart { height: 280px; width: 100%; border-radius: 6px; position: relative; }
-
-.chart-type-btn { background: transparent; border: 1px solid var(--border-cyan); color: var(--text); padding: 2px 6px; border-radius: 4px; font-size: 9px; cursor: pointer; }
-.chart-type-btn.active { background: var(--cyan); color: #000; font-weight: bold; }
+#chart { height: 280px; width: 100%; border-radius: 6px; }
 
 .sentiment-box { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border-pink); }
 .bar-wrap { height: 6px; width: 100%; background: var(--red); border-radius: 4px; overflow: hidden; margin: 4px 0; display: flex; }
@@ -591,10 +289,6 @@ select { background: var(--panel); color: var(--text); border: 1px solid var(--b
 input:checked + .slider { background-color: var(--green); }
 input:checked + .slider:before { transform: translateX(16px); }
 
-.api-vault-btn { background: rgba(0, 240, 255, 0.15); color: var(--cyan); border: 1.5px solid var(--cyan); border-radius: 6px; padding: 8px 10px; width: 100%; font-size: 11px; font-weight: 800; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; margin-bottom: 8px; }
-.api-vault-modal { display: none; background: var(--panel); border: 2px solid var(--border-pink); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.api-vault-modal input { width: 100%; margin-bottom: 6px; padding: 6px; font-size: 11px; background: var(--card-bg); color: var(--text); border: 1px solid var(--border-cyan); border-radius: 4px; }
-
 .btn { width: 100%; padding: 8px; border: none; border-radius: 6px; font-weight: 800; cursor: pointer; font-size: 11px; margin-top: 4px; }
 .btn-save { background: rgba(0, 240, 255, 0.3); color: var(--cyan); border: 1.5px solid var(--cyan); margin-bottom: 5px; }
 .btn-manual-buy { background: rgba(0, 255, 102, 0.25); color: var(--green); border: 1.5px solid var(--green); }
@@ -612,26 +306,16 @@ input:checked + .slider:before { transform: translateX(16px); }
   border-radius: 10px; padding: 12px; margin-top: 10px;
 }
 .radar-canvas-box { text-align: center; }
-#masterRadar {
-  background: var(--card-bg);
-  border-radius: 50%; border: 2px solid var(--cyan);
-}
-.radar-hud-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
-  flex: 1; min-width: 260px; margin-left: 12px;
-}
+#masterRadar { background: var(--card-bg); border-radius: 50%; border: 2px solid var(--cyan); }
+.radar-hud-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; flex: 1; min-width: 260px; margin-left: 12px; }
 @media(max-width: 600px) { .radar-hud-grid { grid-template-columns: repeat(2, 1fr); margin-left: 0; margin-top: 10px; } }
-.hud-coin-card {
-  background: var(--card-bg); border: 1px solid var(--border-cyan); border-radius: 6px;
-  padding: 6px; text-align: center;
-}
+.hud-coin-card { background: var(--card-bg); border: 1px solid var(--border-cyan); border-radius: 6px; padding: 6px; text-align: center; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <div class="header-left">
-    <img id="user-avatar" class="profile-avatar" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='34' height='34' viewBox='0 0 24 24' fill='%2300f0ff'><circle cx='12' cy='8' r='4'/><path d='M12 14c-5 0-8 3-8 6v1h16v-1c0-3-3-6-8-6z'/></svg>">
     <div class="brand">⚡ CYBERPUNK TRADING TERMINAL</div>
   </div>
   <div style="display:flex; align-items:center; gap:5px;">
@@ -641,7 +325,7 @@ input:checked + .slider:before { transform: translateX(16px); }
       <option value="binance">Binance Dark</option>
       <option value="oled">OLED Black</option>
     </select>
-    <div class="mode-badge mode-demo" id="mode-toggle" onclick="toggleTradingMode()">DEMO MODE</div>
+    <div class="mode-badge mode-live" id="mode-toggle" onclick="toggleTradingMode()">LIVE TRADING</div>
   </div>
 </div>
 
@@ -651,7 +335,7 @@ input:checked + .slider:before { transform: translateX(16px); }
   <div class="an-card"><div class="an-title">২৪ ঘণ্টার লাভ</div><div class="an-val mono" id="v-24h-pnl">$0.00</div></div>
   <div class="an-card"><div class="an-title">বাই / সেল</div><div class="an-val mono"><span style="color:var(--green);" id="v-tot-buy">0</span> / <span style="color:var(--red);" id="v-tot-sell">0</span></div></div>
   <div class="an-card"><div class="an-title">উইন রেট</div><div class="an-val mono" id="v-winrate" style="color:var(--cyan);">0%</div></div>
-  <div class="an-card"><div class="an-title">USDT ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--green);">$1000.00</div></div>
+  <div class="an-card"><div class="an-title">USDT ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--green);">$0.00</div></div>
 </div>
 
 <div class="market-nav">
@@ -670,11 +354,6 @@ input:checked + .slider:before { transform: translateX(16px); }
     <div class="box">
       <div class="box-head">
         <span>লাইভ চার্ট: <b style="color:var(--cyan);" id="chart-sym">BTCUSDT</b></span>
-        <div style="display:flex; gap:3px;">
-          <button class="chart-type-btn active" onclick="switchChartType('candlestick', this)">ক্যান্ডেল</button>
-          <button class="chart-type-btn" onclick="switchChartType('area', this)">এরিয়া</button>
-          <button class="chart-type-btn" onclick="switchChartType('line', this)">লাইন</button>
-        </div>
       </div>
       <div id="chart"></div>
 
@@ -702,16 +381,6 @@ input:checked + .slider:before { transform: translateX(16px); }
   </div>
 
   <div>
-    <button class="api-vault-btn" onclick="toggleApiVault()">🔑 Binance API ভল্ট (গোপন ও এনক্রিপ্টেড)</button>
-
-    <div class="api-vault-modal" id="api-vault-box">
-      <input type="text" id="api-key" placeholder="API Key পেস্ট করুন" class="mono">
-      <input type="text" id="api-sec" placeholder="Secret Key পেস্ট করুন" class="mono">
-      <div style="display:flex; gap:5px; margin-bottom:5px;">
-        <button class="btn btn-save" style="margin:0;" onclick="saveApiKeys()">সংরক্ষণ করুন</button>
-      </div>
-    </div>
-
     <div class="box">
       <div class="box-head">
         <span id="cfg-sym">BTCUSDT</span>
@@ -755,23 +424,7 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 <script>
 let activeSymbol = "BTCUSDT";
-let curChartType = "candlestick";
-let chartDataCache = [];
 let chartEl = document.getElementById('chart');
-
-window.addEventListener('load', () => {
-  const k = localStorage.getItem('user_api_key');
-  const s = localStorage.getItem('user_api_sec');
-  if(k) document.getElementById('api-key').value = k;
-  if(s) document.getElementById('api-sec').value = s;
-  if(k && s) {
-    fetch('/api/save_keys', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({key: k, secret: s})
-    });
-  }
-});
 
 function applyTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
@@ -784,32 +437,11 @@ function applyTheme(t) {
   });
 }
 
-function toggleApiVault() {
-  const f = document.getElementById('api-vault-box');
-  f.style.display = (f.style.display === 'block') ? 'none' : 'block';
-}
-
 function toggleTradingMode() {
   fetch('/api/toggle_mode', {method:'POST'}).then(r=>r.json()).then(d=>{
     const b = document.getElementById('mode-toggle');
     b.className = d.live_mode ? "mode-badge mode-live" : "mode-badge mode-demo";
     b.innerText = d.live_mode ? "LIVE TRADING" : "DEMO MODE";
-  });
-}
-
-function saveApiKeys() {
-  const k = document.getElementById('api-key').value.trim();
-  const s = document.getElementById('api-sec').value.trim();
-  if(!k || !s) { alert('API Key ও Secret পূরণ করুন!'); return; }
-  localStorage.setItem('user_api_key', k);
-  localStorage.setItem('user_api_sec', s);
-  fetch('/api/save_keys', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({key: k, secret: s})
-  }).then(r=>r.json()).then(d=>{
-    alert('API Key সফলভাবে সেভ হয়েছে!');
-    document.getElementById('api-vault-box').style.display = 'none';
   });
 }
 
@@ -849,32 +481,12 @@ const ch = LightweightCharts.createChart(chartEl, {
 });
 let series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
 
-function switchChartType(type, btn) {
-  document.querySelectorAll('.chart-type-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  ch.removeSeries(series);
-  curChartType = type;
-
-  if (type === 'candlestick') {
-    series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
-    series.setData(chartDataCache);
-  } else if (type === 'area') {
-    series = ch.addAreaSeries({ topColor: 'rgba(0,240,255,0.35)', bottomColor: 'rgba(0,240,255,0.0)', lineColor: '#00f0ff', lineWidth: 2 });
-    series.setData(chartDataCache.map(k => ({ time: k.time, value: k.close })));
-  } else if (type === 'line') {
-    series = ch.addLineSeries({ color: '#00f0ff', lineWidth: 2 });
-    series.setData(chartDataCache.map(k => ({ time: k.time, value: k.close })));
-  }
-}
-
 function loadChartData(sym) {
   fetch('/api/klines?symbol=' + sym)
     .then(r => r.json())
     .then(d => {
       if(d && d.length > 0) {
-        chartDataCache = d;
-        if (curChartType === 'candlestick') series.setData(d);
-        else series.setData(d.map(k => ({ time: k.time, value: k.close })));
+        series.setData(d);
         ch.timeScale().fitContent();
       }
     }).catch(e=>{});
@@ -889,13 +501,8 @@ function toggleCurrentMarket() {
   });
 }
 
-function instantBuy() {
-  fetch('/api/instant_buy?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'});
-}
-
-function instantSell() {
-  fetch('/api/instant_sell?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'});
-}
+function instantBuy() { fetch('/api/instant_buy?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}); }
+function instantSell() { fetch('/api/instant_sell?symbol=' + encodeURIComponent(activeSymbol), {method:'POST'}); }
 
 function saveCurrentConfig() {
   const p = {
@@ -920,7 +527,6 @@ let radarBlips = [];
 function drawMasterRadar() {
   rCtx.clearRect(0,0,200,200);
   const cx = 100, cy = 100, r = 85;
-
   rCtx.strokeStyle = 'rgba(0, 240, 255, 0.4)';
   rCtx.lineWidth = 1;
   for(let i=1; i<=3; i++) {
@@ -928,7 +534,6 @@ function drawMasterRadar() {
     rCtx.arc(cx, cy, (r/3)*i, 0, Math.PI*2);
     rCtx.stroke();
   }
-
   rCtx.save();
   rCtx.translate(cx, cy);
   rCtx.rotate(rAngle);
@@ -948,7 +553,6 @@ function drawMasterRadar() {
     rCtx.font = '8px "JetBrains Mono"';
     rCtx.fillText(b.name, b.x + 4, b.y + 3);
   });
-
   rAngle += 0.04;
   requestAnimationFrame(drawMasterRadar);
 }
@@ -1034,9 +638,7 @@ setInterval(()=>{
       }
 
       if(cur.price > 0) {
-        const tick = {time: Math.floor(Date.now()/1000), open: cur.price, high: cur.price, low: cur.price, close: cur.price};
-        if(curChartType === 'candlestick') series.update(tick);
-        else series.update({time: tick.time, value: cur.price});
+        series.update({time: Math.floor(Date.now()/1000), open: cur.price, high: cur.price, low: cur.price, close: cur.price});
       }
 
       document.getElementById('bids-list').innerHTML = cur.bids.map(b=>`<tr><td style="color:var(--green)">$${(+b[0]).toFixed(b[0]>=1?2:4)}</td><td>${(+b[1]).toFixed(2)}</td></tr>`).join('');
@@ -1073,8 +675,6 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     "realized_pnl": bot["realized_pnl"],
                     "pnl_1h": bot["pnl_1h"],
                     "pnl_24h": bot["pnl_24h"],
-                    "trades_1h": bot["trades_1h"],
-                    "trades_24h": bot["trades_24h"],
                     "history": list(bot["history"]),
                     "logs": list(bot["logs"]),
                     "markets": bot["markets"],
@@ -1108,40 +708,13 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     p = m["price"]
                     amt = m["amount"]
                     if bot["live_mode"]:
-                        res, err = execute_binance_order(sym, "BUY", quote_order_qty=amt)
-                        if err:
-                            add_log(f"[{sym}] ❌ লাইভ ম্যানুয়াল বাই ব্যর্থ: {err}")
-                        else:
-                            m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
-                            m["position"] = {"buy_price": p, "amount": amt}
-                            m["unrealized_pnl"] = 0.0
-                            bot["total_buys"] += 1
-                            save_state()
-                            add_log(f"[{sym}] 🟢 [LIVE] ম্যানুয়াল বাই কার্যকর @ ${p:.4f}")
-                            send_telegram(f"⚡ *[LIVE MANUAL BUY]* {sym}\nPrice: `${p:.4f}`\nAmount: `${amt}`")
-                            log_trade_db(sym, "BUY", p, 0.0, 0.0, "Live Manual")
-                            bot["history"].appendleft({
-                                "time": time.strftime("%H:%M:%S"),
-                                "symbol": sym,
-                                "side": "BUY",
-                                "price": round(p, 4),
-                                "pnl": 0.0
-                            })
-                    else:
-                        m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
-                        m["position"] = {"buy_price": p, "amount": amt}
-                        m["unrealized_pnl"] = 0.0
-                        bot["total_buys"] += 1
-                        save_state()
-                        add_log(f"[{sym}] 🟢 [DEMO] ম্যানুয়াল বাই কার্যকর @ ${p:.4f}")
-                        log_trade_db(sym, "BUY", p, 0.0, 0.0, "Demo Manual")
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": sym,
-                            "side": "BUY",
-                            "price": round(p, 4),
-                            "pnl": 0.0
-                        })
+                        execute_binance_order(sym, "BUY", quote_order_qty=amt)
+                    m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
+                    m["position"] = {"buy_price": p, "amount": amt}
+                    bot["total_buys"] += 1
+                    add_log(f"[{sym}] ম্যানুয়াল বাই @ ${p:.2f}")
+                    threading.Thread(target=send_telegram, args=(f"⚡ [MANUAL BUY] {sym} @ ${p:.4f}",), daemon=True).start()
+                    log_trade_db(sym, "BUY", p, 0.0, 0.0, "Manual Buy")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1160,54 +733,17 @@ class CompleteRouter(BaseHTTPRequestHandler):
                         p = m["price"]
                         total_qty = sum(o["qty"] for o in orders)
                         total_cost = sum(o["cost"] for o in orders)
-                        revenue = total_qty * p
-                        profit = revenue - total_cost
+                        profit = (total_qty * p) - total_cost
                         diff = ((p - (total_cost / total_qty)) / (total_cost / total_qty)) * 100
-
                         if bot["live_mode"]:
-                            res, err = execute_binance_order(sym, "SELL", quantity=total_qty)
-                            if err:
-                                add_log(f"[{sym}] ❌ লাইভ ম্যানুয়াল সেল ব্যর্থ: {err}")
-                            else:
-                                bot["realized_pnl"] += profit
-                                bot["pnl_1h"] += profit
-                                bot["pnl_24h"] += profit
-                                bot["total_sells"] += 1
-                                if profit > 0:
-                                    bot["wins"] += 1
-                                save_state()
-                                add_log(f"[{sym}] 🔴 [LIVE] ম্যানুয়াল সেল সফল: {profit:+.2f}$ ({diff:+.2f}%)")
-                                send_telegram(f"🎯 *[LIVE MANUAL SELL]* {sym}\nPrice: `${p:.4f}`\nPnL: `{diff:+.2f}%`")
-                                log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Live Manual Close")
-                                bot["history"].appendleft({
-                                    "time": time.strftime("%H:%M:%S"),
-                                    "symbol": sym,
-                                    "side": "SELL",
-                                    "price": round(p, 4),
-                                    "pnl": round(diff, 2)
-                                })
-                                m["dca_orders"] = []
-                                m["position"] = None
-                        else:
-                            bot["demo_balance"] += profit
-                            bot["realized_pnl"] += profit
-                            bot["pnl_1h"] += profit
-                            bot["pnl_24h"] += profit
-                            bot["total_sells"] += 1
-                            if profit > 0:
-                                bot["wins"] += 1
-                            save_state()
-                            add_log(f"[{sym}] 🔴 [DEMO] ম্যানুয়াল সেল: {profit:+.2f}$")
-                            log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Demo Manual Close")
-                            bot["history"].appendleft({
-                                "time": time.strftime("%H:%M:%S"),
-                                "symbol": sym,
-                                "side": "SELL",
-                                "price": round(p, 4),
-                                "pnl": round(diff, 2)
-                            })
-                            m["dca_orders"] = []
-                            m["position"] = None
+                            execute_binance_order(sym, "SELL", quantity=total_qty)
+                        bot["realized_pnl"] += profit
+                        bot["total_sells"] += 1
+                        add_log(f"[{sym}] ম্যানুয়াল সেল: {profit:+.2f}$")
+                        threading.Thread(target=send_telegram, args=(f"🎯 [MANUAL SELL] {sym} @ ${p:.4f} PnL: {diff:+.2f}%",), daemon=True).start()
+                        log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Sell")
+                        m["dca_orders"] = []
+                        m["position"] = None
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1229,29 +765,6 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
 
-        elif self.path == '/api/save_keys':
-            sz = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(sz).decode('utf-8'))
-            k = data.get("key", "").strip()
-            s = data.get("secret", "").strip()
-            save_config(k, s)
-            add_log("API Key ক্লাউডে সংরক্ষিত হয়েছে")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
-
-        elif self.path == '/api/toggle_mode':
-            with lock:
-                bot["live_mode"] = not bot["live_mode"]
-                mode = "LIVE" if bot["live_mode"] else "DEMO"
-                add_log(f"ট্রেডিং মোড: {mode}")
-                res = {"live_mode": bot["live_mode"]}
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(res).encode('utf-8'))
-
         elif self.path.startswith('/api/toggle'):
             query = self.path.split('?')
             sym = "BTCUSDT"
@@ -1265,6 +778,17 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     res = {"running": bot["markets"][sym]["running"]}
                 else:
                     res = {"running": False}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode('utf-8'))
+
+        elif self.path == '/api/toggle_mode':
+            with lock:
+                bot["live_mode"] = not bot["live_mode"]
+                mode = "LIVE" if bot["live_mode"] else "DEMO"
+                add_log(f"ট্রেডিং মোড: {mode}")
+                res = {"live_mode": bot["live_mode"]}
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1292,9 +816,8 @@ class CompleteRouter(BaseHTTPRequestHandler):
         return
 
 def run_server():
-    server_port = int(os.environ.get("PORT", 8080))
-    print(f"\nTerminal Listening on 0.0.0.0:{server_port}\n", flush=True)
-    srv = ReusableThreadingServer(("0.0.0.0", server_port), CompleteRouter)
+    print(f"\nTerminal Listening on 0.0.0.0:{PORT}\n", flush=True)
+    srv = ReusableThreadingServer((HOST, PORT), CompleteRouter)
     srv.serve_forever()
 
 if __name__ == "__main__":
