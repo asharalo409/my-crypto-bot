@@ -17,7 +17,6 @@ from flask import Flask, jsonify, request, render_template_string
 
 APP = Flask(__name__)
 
-# Credentials: environment variables or config.py
 try:
     import config as _cfg
 except ImportError:
@@ -101,41 +100,37 @@ def db():
 
 def init_db():
     with db() as c:
-        old_positions = c.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name='positions'"
-        ).fetchone()
+        cols = {
+            r["name"]
+            for r in c.execute("PRAGMA table_info(positions)").fetchall()
+        }
 
-        if old_positions:
-            cols = {
-                r["name"]
-                for r in c.execute("PRAGMA table_info(positions)").fetchall()
-            }
+        if cols and ("mode" not in cols or "symbol" not in cols):
+            c.execute("ALTER TABLE positions RENAME TO positions_old")
+            cols = set()
 
-            pk = [
-                r["name"]
-                for r in c.execute("PRAGMA table_info(positions)").fetchall()
-                if r["pk"]
-            ]
+        if not cols:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS positions (
+                    mode TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    qty TEXT NOT NULL,
+                    entry TEXT NOT NULL,
+                    spent TEXT NOT NULL,
+                    opened TEXT NOT NULL,
+                    order_id TEXT,
+                    stop TEXT,
+                    take TEXT,
+                    PRIMARY KEY(mode, symbol)
+                )
+            """)
 
-            if "mode" not in cols or pk != ["mode", "symbol"]:
-                c.execute("ALTER TABLE positions RENAME TO positions_old")
+            old_exists = c.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name='positions_old'
+            """).fetchone()
 
-                c.execute("""
-                    CREATE TABLE positions (
-                        mode TEXT NOT NULL,
-                        symbol TEXT NOT NULL,
-                        qty TEXT NOT NULL,
-                        entry TEXT NOT NULL,
-                        spent TEXT NOT NULL,
-                        opened TEXT NOT NULL,
-                        order_id TEXT,
-                        stop TEXT,
-                        take TEXT,
-                        PRIMARY KEY (mode, symbol)
-                    )
-                """)
-
+            if old_exists:
                 old_cols = {
                     r["name"]
                     for r in c.execute(
@@ -148,7 +143,6 @@ def init_db():
                 ).fetchall():
                     d = dict(row)
                     mode = str(d.get("mode", "DEMO")).upper()
-
                     if mode not in ("DEMO", "LIVE"):
                         mode = "DEMO"
 
@@ -169,21 +163,6 @@ def init_db():
                     ))
 
                 c.execute("DROP TABLE positions_old")
-        else:
-            c.execute("""
-                CREATE TABLE positions (
-                    mode TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    qty TEXT NOT NULL,
-                    entry TEXT NOT NULL,
-                    spent TEXT NOT NULL,
-                    opened TEXT NOT NULL,
-                    order_id TEXT,
-                    stop TEXT,
-                    take TEXT,
-                    PRIMARY KEY (mode, symbol)
-                )
-            """)
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
@@ -207,7 +186,9 @@ def init_db():
         }
 
         if "mode" not in trade_cols:
-            c.execute("ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'DEMO'")
+            c.execute(
+                "ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'DEMO'"
+            )
 
         if "order_id" not in trade_cols:
             c.execute("ALTER TABLE trades ADD COLUMN order_id TEXT")
@@ -240,7 +221,6 @@ def current_mode():
 
 def positions(mode=None):
     mode = mode or current_mode()
-
     with db() as c:
         return [
             dict(r) for r in c.execute(
@@ -252,7 +232,6 @@ def positions(mode=None):
 
 def history(mode=None):
     mode = mode or current_mode()
-
     with db() as c:
         return [
             dict(r) for r in c.execute(
@@ -264,34 +243,26 @@ def history(mode=None):
 
 def get_position(symbol, mode=None):
     mode = mode or current_mode()
-
     with db() as c:
         r = c.execute(
             "SELECT * FROM positions WHERE mode=? AND symbol=?",
             (mode, symbol)
         ).fetchone()
-
         return dict(r) if r else None
 
 
 def wallet(mode=None):
     mode = mode or current_mode()
-
     with db() as c:
         r = c.execute(
             "SELECT * FROM wallets WHERE mode=?", (mode,)
         ).fetchone()
-
         return dict(r)
 
 
 def update_wallet(mode, **values):
-    allowed = {
-        "balance", "realized_pnl", "buys", "sells", "wins"
-    }
-
+    allowed = {"balance", "realized_pnl", "buys", "sells", "wins"}
     keys = [k for k in values if k in allowed]
-
     if not keys:
         return
 
@@ -348,10 +319,7 @@ def telegram(message):
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message[:3900]
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message[:3900]},
             timeout=10
         )
         return r.ok and r.json().get("ok", False)
@@ -367,15 +335,11 @@ class Binance:
         self.session = requests.Session()
 
         if self.key:
-            self.session.headers.update({
-                "X-MBX-APIKEY": self.key
-            })
+            self.session.headers.update({"X-MBX-APIKEY": self.key})
 
     def public(self, path, params=None):
         r = self.session.get(
-            BASE + path,
-            params=params or {},
-            timeout=15
+            BASE + path, params=params or {}, timeout=15
         )
         r.raise_for_status()
         return r.json()
@@ -383,7 +347,7 @@ class Binance:
     def signed(self, method, path, params=None):
         if not self.key or not self.secret:
             raise RuntimeError(
-                "Binance API Key/Secret config.py বা environment-এ সেট করো"
+                "Binance API Key/Secret config.py অথবা environment-এ সেট করো"
             )
 
         p = dict(params or {})
@@ -392,20 +356,20 @@ class Binance:
 
         query = urlencode(p)
         signature = hmac.new(
-            self.secret.encode(),
-            query.encode(),
-            hashlib.sha256
+            self.secret.encode(), query.encode(), hashlib.sha256
         ).hexdigest()
 
-        url = BASE + path + "?" + query + "&signature=" + signature
-        r = self.session.request(method, url, timeout=20)
+        r = self.session.request(
+            method,
+            BASE + path + "?" + query + "&signature=" + signature,
+            timeout=20
+        )
 
         if not r.ok:
             try:
                 message = r.json().get("msg", r.text)
             except Exception:
                 message = r.text
-
             raise RuntimeError("Binance API error: " + str(message)[:250])
 
         return r.json()
@@ -476,7 +440,6 @@ bn = Binance()
 
 def order_average(order):
     fills = order.get("fills") or []
-
     qty = sum(float(f.get("qty", 0)) for f in fills)
     quote = sum(
         float(f.get("qty", 0)) * float(f.get("price", 0))
@@ -497,8 +460,7 @@ def order_average(order):
 
 def live_account_balance():
     account = bn.account()
-
-    usdt = next(
+    balance = next(
         (
             float(b["free"]) + float(b["locked"])
             for b in account.get("balances", [])
@@ -508,12 +470,11 @@ def live_account_balance():
     )
 
     live_balance_cache.update({
-        "USDT": usdt,
+        "USDT": balance,
         "updated": utcnow(),
         "error": ""
     })
-
-    return usdt
+    return balance
 
 
 def paper_buy(symbol, price, usdt, reason):
@@ -523,7 +484,6 @@ def paper_buy(symbol, price, usdt, reason):
         raise RuntimeError("DEMO balance পর্যাপ্ত নয়")
 
     qty = usdt / price
-
     save_position(symbol, qty, price, usdt, "DEMO")
 
     update_wallet(
@@ -532,40 +492,29 @@ def paper_buy(symbol, price, usdt, reason):
         buys=int(w["buys"]) + 1
     )
 
-    log_trade(
-        symbol, "BUY", price, qty, usdt, 0,
-        reason, "DEMO"
-    )
-
+    log_trade(symbol, "BUY", price, qty, usdt, 0, reason, "DEMO")
     telegram(
         f"🟢 DEMO BUY\n{symbol}\nPrice: {price}\n"
         f"Amount: {usdt:.2f} USDT"
     )
 
-    return {
-        "mode": "DEMO",
-        "qty": qty,
-        "price": price,
-        "quote": usdt
-    }
+    return {"mode": "DEMO", "qty": qty, "price": price, "quote": usdt}
 
 
 def live_buy(symbol, usdt, reason):
     if not state["live_armed"]:
-        raise RuntimeError("আগে LIVE trading enable করো")
+        raise RuntimeError("LIVE trading enable করা নেই")
 
     if symbol not in exchange_filters:
         bn.load_filters()
 
     f = exchange_filters[symbol]
-
     if usdt < float(f["min_notional"]):
         raise RuntimeError(
             f"{symbol} minimum order প্রায় {f['min_notional']} USDT"
         )
 
     balance = live_account_balance()
-
     if balance < usdt:
         raise RuntimeError(
             f"LIVE USDT balance পর্যাপ্ত নয়: {balance:.4f} USDT"
@@ -575,8 +524,7 @@ def live_buy(symbol, usdt, reason):
     avg, qty, quote = order_average(order)
 
     save_position(
-        symbol, qty, avg, quote, "LIVE",
-        order.get("orderId", "")
+        symbol, qty, avg, quote, "LIVE", order.get("orderId", "")
     )
 
     w = wallet("LIVE")
@@ -588,16 +536,11 @@ def live_buy(symbol, usdt, reason):
     )
 
     telegram(
-        f"🔴 LIVE BUY FILLED\n{symbol}\n"
-        f"Avg: {avg}\nQty: {qty}\nSpent: {quote:.4f} USDT"
+        f"🔴 LIVE BUY FILLED\n{symbol}\nAvg: {avg}\n"
+        f"Qty: {qty}\nSpent: {quote:.4f} USDT"
     )
 
-    return {
-        "mode": "LIVE",
-        "qty": qty,
-        "price": avg,
-        "quote": quote
-    }
+    return {"mode": "LIVE", "qty": qty, "price": avg, "quote": quote}
 
 
 def buy_symbol(symbol, reason="Manual buy"):
@@ -608,9 +551,7 @@ def buy_symbol(symbol, reason="Manual buy"):
         mode = current_mode()
 
         if mode == "LIVE" and not state["live_armed"]:
-            raise RuntimeError(
-                "LIVE view নির্বাচন করা আছে, কিন্তু LIVE trading enable করা নেই"
-            )
+            raise RuntimeError("LIVE trading enable করা নেই")
 
         if get_position(symbol, mode):
             raise RuntimeError(
@@ -622,10 +563,7 @@ def buy_symbol(symbol, reason="Manual buy"):
                 f"{mode} mode-এর maximum position limit পূর্ণ"
             )
 
-        if (
-            reason != "Manual buy"
-            and not state["symbols"][symbol]["enabled"]
-        ):
+        if reason != "Manual buy" and not state["symbols"][symbol]["enabled"]:
             raise RuntimeError(f"{symbol} disabled")
 
         price = bn.price(symbol)
@@ -646,19 +584,14 @@ def sell_position(symbol, price, reason, mode=None):
         pos = get_position(symbol, mode)
 
         if not pos:
-            return {
-                "ok": False,
-                "error": f"{mode} mode-এ position পাওয়া যায়নি"
-            }
+            return {"ok": False, "error": f"{mode} position পাওয়া যায়নি"}
 
         entry = float(pos["entry"])
         qty = float(pos["qty"])
 
         if mode == "LIVE":
             if not state["live_armed"]:
-                raise RuntimeError(
-                    "LIVE sell করতে আগে LIVE trading enable করো"
-                )
+                raise RuntimeError("LIVE trading enable করা নেই")
 
             account = bn.account()
             base_asset = symbol[:-4] if symbol.endswith("USDT") else symbol
@@ -671,18 +604,14 @@ def sell_position(symbol, price, reason, mode=None):
                 ),
                 0.0
             )
-
             qty = min(qty, free)
 
             if qty <= 0:
-                raise RuntimeError(
-                    "বিক্রির জন্য free balance পাওয়া যায়নি"
-                )
+                raise RuntimeError("বিক্রির জন্য free balance পাওয়া যায়নি")
 
             order = bn.market_sell(symbol, qty)
             avg, sold_qty, quote = order_average(order)
             order_id = order.get("orderId", "")
-
         else:
             avg = price
             sold_qty = qty
@@ -696,7 +625,6 @@ def sell_position(symbol, price, reason, mode=None):
             symbol, "SELL", avg, sold_qty, quote,
             pnl, reason, mode, order_id
         )
-
         remove_position(symbol, mode)
 
         w = wallet(mode)
@@ -718,12 +646,8 @@ def sell_position(symbol, price, reason, mode=None):
         )
 
         return {
-            "ok": True,
-            "symbol": symbol,
-            "price": avg,
-            "qty": sold_qty,
-            "pnl": pnl,
-            "mode": mode
+            "ok": True, "symbol": symbol, "price": avg,
+            "qty": sold_qty, "pnl": pnl, "mode": mode
         }
 
 
@@ -739,10 +663,8 @@ def tick():
             previous = last_prices.get(symbol)
             last_prices[symbol] = price
 
-            # Manage each mode independently.
             for mode in ("DEMO", "LIVE"):
                 pos = get_position(symbol, mode)
-
                 if not pos:
                     continue
 
@@ -759,7 +681,6 @@ def tick():
 
                 if pnl_pct >= float(state["tp"]):
                     sell_position(symbol, price, "Take Profit", mode)
-
                 elif pnl_pct <= -float(state["sl"]):
                     if state["no_loss"]:
                         if mode == current_mode():
@@ -770,30 +691,26 @@ def tick():
                         sell_position(symbol, price, "Stop Loss", mode)
 
             mode = current_mode()
-
             if (
                 state["running"]
                 and state["strategy"]
                 and state["symbols"][symbol]["enabled"]
                 and not get_position(symbol, mode)
                 and (mode == "DEMO" or state["live_armed"])
+                and previous
+                and previous > 0
             ):
-                if previous and previous > 0:
-                    change = (price - previous) / previous * 100
-
-                    if (
-                        change >= 0.15
-                        and time.time() -
-                        last_buy_time.get((mode, symbol), 0) > 300
-                    ):
-                        buy_symbol(symbol, "Momentum signal")
-                        last_buy_time[(mode, symbol)] = time.time()
+                change = (price - previous) / previous * 100
+                if (
+                    change >= 0.15
+                    and time.time() - last_buy_time.get((mode, symbol), 0) > 300
+                ):
+                    buy_symbol(symbol, "Momentum signal")
+                    last_buy_time[(mode, symbol)] = time.time()
 
             if not get_position(symbol, current_mode()):
                 state["symbols"][symbol]["status"] = (
-                    "Watching"
-                    if state["symbols"][symbol]["enabled"]
-                    else "Paused"
+                    "Watching" if state["symbols"][symbol]["enabled"] else "Paused"
                 )
 
         except Exception as e:
@@ -813,7 +730,6 @@ def worker():
                     live_account_balance()
                 except Exception as e:
                     live_balance_cache["error"] = str(e)[:250]
-
         except Exception:
             log.exception("Worker error")
 
@@ -833,7 +749,6 @@ main{max-width:1100px;margin:auto}
 .card{background:#151e33;border:1px solid #2d3b5b;border-radius:14px;padding:16px;margin:12px 0;overflow:auto}
 button,input{padding:9px;border-radius:8px;border:1px solid #415477;margin:4px;background:#10192b;color:#fff}
 button{cursor:pointer;background:#165dce}
-button:disabled{opacity:.5;cursor:not-allowed}
 table{width:100%;border-collapse:collapse}
 td,th{text-align:left;padding:8px;border-bottom:1px solid #34415a;white-space:nowrap}
 small{color:#a9b8d4}
@@ -884,7 +799,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 
 <div class="card">
 <h2>LIVE Trading Permission</h2>
-<p class="warn">LIVE mode-এ real order হতে পারে। API Key-তে withdrawal permission চালু কোরো না।</p>
+<p class="warn">LIVE mode-এ real order হতে পারে। Binance API Key-তে withdrawal permission চালু কোরো না।</p>
 <button onclick="toggleLive(true)">Enable LIVE Trading</button>
 <button onclick="toggleLive(false)">Disable LIVE Trading</button>
 <button onclick="post('/api/check-api')">Check Binance API</button>
@@ -933,7 +848,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 </main>
 
 <script>
-let selectedMode = 'DEMO';
+let selectedMode='DEMO';
 
 async function post(url,data={}){
  try{
@@ -960,7 +875,7 @@ async function switchMode(mode){
 }
 
 async function toggleLive(enabled){
- if(enabled&&!confirm('LIVE trading চালু করবেন? এটি বাস্তব USDT দিয়ে order দিতে পারে।'))return;
+ if(enabled&&!confirm('LIVE trading চালু করবেন? বাস্তব টাকা দিয়ে order হতে পারে।'))return;
  await post('/api/live',{enabled});
 }
 
@@ -981,23 +896,29 @@ async function sym(symbol,enabled){
 }
 
 async function buy(symbol){
- const msg=selectedMode==='LIVE'
+ const message=selectedMode==='LIVE'
   ?'LIVE BUY: বাস্তব টাকা দিয়ে '+symbol+' কিনবেন?'
   :'DEMO BUY: virtual '+symbol+' কিনবেন?';
- if(confirm(msg))await post('/api/buy',{symbol});
+ if(confirm(message))await post('/api/buy',{symbol});
 }
 
 async function sell(symbol){
- const msg=selectedMode==='LIVE'
+ const message=selectedMode==='LIVE'
   ?'LIVE SELL: বাস্তব '+symbol+' position বিক্রি করবেন?'
   :'DEMO SELL: virtual '+symbol+' position বন্ধ করবেন?';
- if(confirm(msg))await post('/api/sell',{symbol});
+ if(confirm(message))await post('/api/sell',{symbol});
 }
 
 function money(n){
  return Number(n||0).toLocaleString('en-US',{
   minimumFractionDigits:2,maximumFractionDigits:2
  });
+}
+
+function esc(v){
+ return String(v??'').replace(/[&<>"']/g,c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+ }[c]));
 }
 
 async function refresh(){
@@ -1012,7 +933,6 @@ async function refresh(){
    selectedMode==='LIVE'?'active-mode':'';
 
   document.getElementById('modeValue').textContent=selectedMode;
-
   document.getElementById('status').textContent=
    (s.running?'Running':'Stopped')+' · '+selectedMode+
    ' · LIVE Trading: '+(s.live_armed?'ENABLED':'DISABLED')+
@@ -1032,8 +952,8 @@ async function refresh(){
    document.getElementById('realized').textContent=
     '$'+money(d.live_wallet.realized_pnl);
    document.getElementById('balanceNote').innerHTML=
-    '<small>Binance account-এর actual free + locked USDT balance. '+
-    (d.live_balance_error?('Error: '+d.live_balance_error):'')+'</small>';
+    '<small>Binance actual USDT balance. '+
+    esc(d.live_balance_error||'')+'</small>';
   }
 
   document.getElementById('openCount').textContent=d.positions.length;
@@ -1055,31 +975,31 @@ async function refresh(){
 
   document.getElementById('modeNotice').textContent=
    selectedMode==='DEMO'
-   ?'DEMO: virtual 10,000 USDT থেকে শুরু। LIVE order দেওয়া হবে না।'
+   ?'DEMO: virtual 10,000 USDT. Real orders disabled in this mode.'
    :(s.live_armed
-    ?'LIVE view selected. Real order permission enabled.'
-    :'LIVE view selected. Real order permission is still disabled.');
+    ?'LIVE view selected. Real trading permission enabled.'
+    :'LIVE view selected. Real trading permission disabled.');
 
   document.getElementById('markets').innerHTML=
    Object.entries(s.symbols).map(([k,v])=>
-    '<tr><td>'+k+'</td><td>'+Number(v.price).toPrecision(8)+
-    '</td><td>'+v.status+'</td><td><input type="checkbox" '+
-    (v.enabled?'checked':'')+' onchange="sym(\\''+k+'\\',this.checked)">'+
-    '</td><td><button onclick="buy(\\''+k+'\\')">BUY</button></td></tr>'
+    '<tr><td>'+esc(k)+'</td><td>'+Number(v.price).toPrecision(8)+
+    '</td><td>'+esc(v.status)+'</td><td><input type="checkbox" '+
+    (v.enabled?'checked':'')+' onchange="sym(\''+k+'\',this.checked)">'+
+    '</td><td><button onclick="buy(\''+k+'\')">BUY</button></td></tr>'
    ).join('');
 
   document.getElementById('positions').innerHTML=
    d.positions.map(p=>
-    '<tr><td>'+p.symbol+'</td><td>'+p.qty+'</td><td>'+p.entry+
-    '</td><td>'+p.spent+'</td><td>'+p.mode+
-    '</td><td><button onclick="sell(\\''+p.symbol+'\\')">SELL/CLOSE</button></td></tr>'
+    '<tr><td>'+esc(p.symbol)+'</td><td>'+esc(p.qty)+'</td><td>'+esc(p.entry)+
+    '</td><td>'+esc(p.spent)+'</td><td>'+esc(p.mode)+
+    '</td><td><button onclick="sell(\''+p.symbol+'\')">SELL/CLOSE</button></td></tr>'
    ).join('')||'<tr><td colspan="6">No open positions</td></tr>';
 
   document.getElementById('history').innerHTML=
    d.history.map(h=>
-    '<tr><td>'+h.time+'</td><td>'+h.symbol+'</td><td>'+h.side+
-    '</td><td>'+h.price+'</td><td>'+h.qty+'</td><td>'+h.pnl+
-    '</td><td>'+h.reason+'</td><td>'+h.mode+'</td></tr>'
+    '<tr><td>'+esc(h.time)+'</td><td>'+esc(h.symbol)+'</td><td>'+esc(h.side)+
+    '</td><td>'+esc(h.price)+'</td><td>'+esc(h.qty)+'</td><td>'+esc(h.pnl)+
+    '</td><td>'+esc(h.reason)+'</td><td>'+esc(h.mode)+'</td></tr>'
    ).join('')||'<tr><td colspan="8">No trade history</td></tr>';
 
  }catch(e){
@@ -1114,17 +1034,15 @@ def api_state():
 
     pos = positions(mode)
     trades = history(mode)
+
     demo_wallet = wallet("DEMO")
     live_wallet = wallet("LIVE")
 
     unrealized = 0.0
-
     for p in pos:
         try:
             price = float(snapshot["symbols"][p["symbol"]]["price"])
-            unrealized += (
-                price - float(p["entry"])
-            ) * float(p["qty"])
+            unrealized += (price - float(p["entry"])) * float(p["qty"])
         except Exception:
             pass
 
@@ -1233,8 +1151,7 @@ def api_live():
         with lock:
             state["live_armed"] = False
 
-        telegram("LIVE trading permission disabled. New live orders are blocked.")
-
+        telegram("LIVE trading disabled. New live orders are blocked.")
         return jsonify({
             "ok": True,
             "live_armed": False,
@@ -1246,7 +1163,6 @@ def api_live():
             raise RuntimeError("Binance API Key/Secret সেট করা নেই")
 
         account = bn.account()
-
         if not account.get("canTrade", False):
             raise RuntimeError(
                 "Binance API account trading অনুমোদন করছে না"
@@ -1259,10 +1175,7 @@ def api_live():
             state["live_armed"] = True
             state["error"] = ""
 
-        telegram(
-            "LIVE TRADING ENABLED. Real orders may use real funds."
-        )
-
+        telegram("LIVE TRADING ENABLED. Real orders may use real funds.")
         return jsonify({
             "ok": True,
             "live_armed": True,
@@ -1286,10 +1199,7 @@ def api_start():
     with lock:
         state["running"] = True
 
-    telegram(
-        "Bot started in " + current_mode() + " view."
-    )
-
+    telegram("Bot started in " + current_mode() + " mode.")
     return jsonify({"ok": True, "running": True})
 
 
@@ -1299,7 +1209,6 @@ def api_stop():
         state["running"] = False
 
     telegram("Bot stopped. Automatic strategy paused.")
-
     return jsonify({"ok": True, "running": False})
 
 
@@ -1310,7 +1219,6 @@ def api_buy():
     try:
         result = buy_symbol(data.get("symbol"), "Manual buy")
         return jsonify({"ok": True, "result": result})
-
     except Exception as e:
         log.exception("Buy failed")
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -1328,12 +1236,9 @@ def api_sell():
         result = sell_position(
             symbol, bn.price(symbol), "Manual sell", current_mode()
         )
-
         if not result.get("ok", False):
             return jsonify(result), 400
-
         return jsonify(result)
-
     except Exception as e:
         log.exception("Sell failed")
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -1342,13 +1247,9 @@ def api_sell():
 @APP.post("/api/test-telegram")
 def api_test_telegram():
     ok = telegram("Crypto Bot Pro Telegram test")
-
     return jsonify({
         "ok": ok,
-        "message": (
-            "Message sent"
-            if ok else "Telegram credentials যাচাই করো"
-        )
+        "message": "Message sent" if ok else "Telegram credentials যাচাই করো"
     }), (200 if ok else 400)
 
 
@@ -1356,7 +1257,6 @@ def api_test_telegram():
 def api_check_api():
     try:
         account = bn.account()
-
         usdt = next(
             (
                 float(b["free"]) + float(b["locked"])
@@ -1365,14 +1265,12 @@ def api_check_api():
             ),
             0.0
         )
-
         return jsonify({
             "ok": True,
             "canTrade": account.get("canTrade"),
             "canWithdraw": account.get("canWithdraw"),
             "usdt_balance": usdt
         })
-
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
