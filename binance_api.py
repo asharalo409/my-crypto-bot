@@ -10,7 +10,7 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    for ep in ["https://data-api.binance.vision/api/v3/time", "https://api.binance.com/api/v3/time"]:
+    for ep in ["https://api.binance.com/api/v3/time", "https://data-api.binance.vision/api/v3/time"]:
         try:
             req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=3) as resp:
@@ -27,7 +27,7 @@ sync_binance_time()
 def binance_signed_request(endpoint, method="GET", params=None):
     global time_offset
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key বা Secret সেট করা নেই"
+        return None, "API Key বা Secret খালি"
     try:
         if params is None:
             params = {}
@@ -37,21 +37,18 @@ def binance_signed_request(endpoint, method="GET", params=None):
         query_string = urllib.parse.urlencode(params)
         signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
         
-        base_urls = ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]
-        for base in base_urls:
-            try:
-                full_url = f"{base}{endpoint}?{query_string}&signature={signature}"
-                req = urllib.request.Request(full_url, method=method)
-                req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
-                req.add_header("User-Agent", "Mozilla/5.0")
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    return json.loads(resp.read().decode()), None
-            except urllib.error.HTTPError as e:
-                err_data = json.loads(e.read().decode())
-                return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
-            except Exception:
-                continue
-        return None, "এপিআই টাইমআউট হয়েছে"
+        full_url = f"https://api.binance.com{endpoint}?{query_string}&signature={signature}"
+        req = urllib.request.Request(full_url, method=method)
+        req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode()), None
+    except urllib.error.HTTPError as e:
+        try:
+            err_data = json.loads(e.read().decode())
+            return None, f"Binance Error {e.code}: {err_data.get('msg', 'Error')}"
+        except Exception:
+            return None, f"HTTP Error {e.code}"
     except Exception as ex:
         return None, str(ex)
 
@@ -77,32 +74,22 @@ def execute_binance_order(symbol, side, quote_order_qty=None, quantity=None):
     return binance_signed_request("/api/v3/order", method="POST", params=params)
 
 def fetch_klines(symbol):
-    endpoints = [
-        f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
-        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
-    ]
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                return json.loads(r.read().decode())
-        except Exception:
-            continue
-    return None
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
 
 def fetch_depth(symbol):
-    endpoints = [
-        f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5",
-        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5"
-    ]
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                return json.loads(r.read().decode())
-        except Exception:
-            continue
-    return {"bids": [], "asks": []}
+    url = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return {"bids": [], "asks": []}
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
