@@ -13,12 +13,13 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 8080))
+PORT = 8080
 
-# আপনার এপিআই কি ও সিক্রেট (সঠিক ৬৪ ক্যারেক্টার)
+# আপনার বাইন্যান্স এপিআই ক্রেডেনশিয়াল
 BINANCE_API_KEY = "0QzotPVZt9eAbkMSuPpDSe0OQXwbQqsYM59o7HmrDHlu46ClaAemMNlnDTIXrNke"
 BINANCE_API_SECRET = "qvhNafkMmHSgsFuOX4bPafqk45bDU1x8HUcasCSDFPBgMd9msH4uoTv2X6CjhQNb"
 
+# টেলিগ্রাম বট কনফিগারেশন
 TELEGRAM_TOKEN = "9089337002:AAFDg1eJBFuQzvEkN5FD1gVh8zk1J1WhZdo"
 TELEGRAM_CHAT_ID = "7741119923"
 
@@ -55,7 +56,11 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    urls = ["https://data-api.binance.vision/api/v3/time", "https://api.binance.com/api/v3/time", "https://api1.binance.com/api/v3/time"]
+    urls = [
+        "https://data-api.binance.vision/api/v3/time",
+        "https://api.binance.com/api/v3/time",
+        "https://api1.binance.com/api/v3/time"
+    ]
     for ep in urls:
         try:
             req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
@@ -133,8 +138,8 @@ def send_telegram(message):
             data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode('utf-8')
             req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0"})
             urllib.request.urlopen(req, timeout=5)
-        except Exception as ex:
-            add_log(f"[টেলিগ্রাম এরর] {str(ex)}")
+        except Exception:
+            pass
     threading.Thread(target=_send, daemon=True).start()
 
 def get_analytics():
@@ -294,7 +299,6 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 .log-box { background: var(--card-bg); border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px; height: 90px; overflow-y: hidden; font-size: 10px; line-height: 1.5; color: var(--cyan); }
 
-/* পূর্ণাঙ্গ উইথ হিস্ট্রি প্যানেল (প্রথম ছবির মতো) */
 .history-full-box {
   background: var(--panel); border: 1.5px solid var(--border-cyan);
   border-radius: 10px; padding: 10px; margin-top: 8px; width: 100%;
@@ -417,7 +421,6 @@ input:checked + .slider:before { transform: translateX(16px); }
   </div>
 </div>
 
-<!-- সম্পূর্ণ স্ক্রিন জুড়ে ট্রেড হিস্ট্রি প্যানেল -->
 <div class="history-full-box mono">
   <div class="box-head">লাইভ ট্রেড হিস্ট্রি</div>
   <table class="hist-table">
@@ -771,12 +774,89 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     m = bot["markets"][sym]
                     m["price"] = p
                     orders = m["dca_orders"]
+                    now = time.time()
+
+                    # ডিসিএ ও অটো সেল লজিক
                     if len(orders) > 0 and p > 0:
                         total_qty = sum(o["qty"] for o in orders)
                         total_cost = sum(o["cost"] for o in orders)
                         avg_price = total_cost / total_qty
                         diff = ((p - avg_price) / avg_price) * 100
                         m["unrealized_pnl"] = round(diff, 2)
+
+                        is_tp = (diff >= m["take_profit"])
+                        is_sl = (not m["no_loss_mode"]) and (diff <= -m["stop_loss"])
+
+                        last_buy = orders[-1]["price"]
+                        # DCA ডিপ বাই লজিক
+                        if (p <= last_buy * 0.985) and (len(orders) < 3) and (now > m["cooldown_until"]):
+                            buy_amt = m["amount"]
+                            if bot["live_mode"]:
+                                execute_binance_order(sym, "BUY", quote_order_qty=buy_amt)
+                            else:
+                                bot["demo_balance"] -= buy_amt
+
+                            orders.append({"price": p, "qty": buy_amt / p, "cost": buy_amt})
+                            bot["total_buys"] += 1
+                            m["cooldown_until"] = now + 15
+                            add_log(f"[{sym}] 🟢 DCA বাই #{len(orders)} @ ${p:.4f}")
+                            send_telegram(f"⚡ [DCA BUY #{len(orders)}] {sym}\nPrice: ${p:.4f}\nTarget: +{m['take_profit']}%")
+
+                        # টেক প্রফিট বা স্টপ লস
+                        elif is_tp or is_sl:
+                            revenue = total_qty * p
+                            profit = revenue - total_cost
+                            side_name = "TAKE PROFIT" if diff > 0 else "STOP LOSS"
+
+                            if bot["live_mode"]:
+                                execute_binance_order(sym, "SELL", quantity=total_qty)
+                            else:
+                                bot["demo_balance"] += (total_cost + profit)
+
+                            bot["realized_pnl"] += profit
+                            bot["total_sells"] += 1
+                            if profit > 0:
+                                bot["wins"] += 1
+
+                            add_log(f"[{sym}] 🔴 {side_name}: {profit:+.2f}$ ({diff:+.2f}%)")
+                            send_telegram(f"🎯 [{side_name}] {sym} ({len(orders)}x DCA)\nExit: ${p:.4f}\nPnL: {diff:+.2f}% (+{profit:.2f}$)")
+                            log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), side_name)
+                            
+                            bot["history"].appendleft({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": f"SELL({len(orders)}x)",
+                                "price": round(p, 4),
+                                "pnl": round(diff, 2)
+                            })
+                            m["dca_orders"] = []
+                            m["position"] = None
+                            m["unrealized_pnl"] = 0.0
+                            m["cooldown_until"] = now + 10
+
+                    elif m["running"] and p > 0:
+                        active_pos = sum(1 for k in bot["markets"].values() if len(k["dca_orders"]) > 0)
+                        if (now > m["cooldown_until"]) and (active_pos < MAX_OPEN_POSITIONS):
+                            buy_amt = m["amount"]
+                            if bot["live_mode"]:
+                                execute_binance_order(sym, "BUY", quote_order_qty=buy_amt)
+                            else:
+                                bot["demo_balance"] -= buy_amt
+
+                            m["dca_orders"] = [{"price": p, "qty": buy_amt / p, "cost": buy_amt}]
+                            m["position"] = {"buy_price": p, "amount": buy_amt}
+                            bot["total_buys"] += 1
+                            add_log(f"[{sym}] 🟢 বেস বাই @ ${p:.4f}")
+                            send_telegram(f"⚡ [BASE BUY] {sym}\nPrice: ${p:.4f}\nTarget: +{m['take_profit']}%")
+                            log_trade_db(sym, "BUY", p, 0.0, 0.0, "Base Entry")
+                            bot["history"].appendleft({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": "BUY",
+                                "price": round(p, 4),
+                                "pnl": 0.0
+                            })
+
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -804,7 +884,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     else:
                         bot["demo_balance"] -= amt
                         add_log(f"[{sym}] 🟢 [DEMO] বাই কার্যকর @ ${p:.2f}")
-                        send_telegram(f"🧪 [DEMO BUY] {sym}\nPrice: ${p:.4f}\nAmount: ${amt}")
+                        send_telegram(f"⚡ [BASE BUY] {sym}\nPrice: ${p:.4f}\nTarget: +{m['take_profit']}%")
 
                     if success:
                         qty = amt / p if p > 0 else 0
@@ -851,7 +931,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
                                 if profit > 0:
                                     bot["wins"] += 1
                                 add_log(f"[{sym}] 🔴 [LIVE] সেল সফল: {profit:+.2f}$ ({diff:+.2f}%)")
-                                send_telegram(f"🎯 [LIVE SELL] {sym}\nExit: ${p:.4f}\nPnL: {diff:+.2f}%\nProfit: {profit:+.2f}$")
+                                send_telegram(f"🎯 [TAKE PROFIT] {sym} ({len(orders)}x DCA)\nExit: ${p:.4f}\nPnL: {diff:+.2f}% (+{profit:.2f}$)")
                         else:
                             bot["demo_balance"] += (total_cost + profit)
                             bot["realized_pnl"] += profit
@@ -859,14 +939,14 @@ class CompleteRouter(BaseHTTPRequestHandler):
                             if profit > 0:
                                 bot["wins"] += 1
                             add_log(f"[{sym}] 🔴 [DEMO] সেল: {profit:+.2f}$ ({diff:+.2f}%)")
-                            send_telegram(f"🎯 [DEMO SELL] {sym}\nExit: ${p:.4f}\nPnL: {diff:+.2f}%\nProfit: {profit:+.2f}$")
+                            send_telegram(f"🎯 [TAKE PROFIT] {sym} ({len(orders)}x DCA)\nExit: ${p:.4f}\nPnL: {diff:+.2f}% (+{profit:.2f}$)")
 
                         if success:
                             log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Sell")
                             bot["history"].appendleft({
                                 "time": time.strftime("%H:%M:%S"),
                                 "symbol": sym,
-                                "side": "SELL",
+                                "side": f"SELL({len(orders)}x)",
                                 "price": round(p, 4),
                                 "pnl": round(diff, 2)
                             })
@@ -943,7 +1023,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
         return
 
 def run_server():
-    print(f"\nTerminal Listening on 0.0.0.0:{PORT}\n", flush=True)
+    print(f"\nTerminal Listening on http://0.0.0.0:{PORT}\n", flush=True)
     srv = ReusableThreadingServer((HOST, PORT), CompleteRouter)
     srv.serve_forever()
 
