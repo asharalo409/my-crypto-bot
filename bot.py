@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8080))
 
-# সঠিক ৬৪ অক্ষরের এপিআই কী ও সিক্রেট
+# আপনার এপিআই কি ও সিক্রেট (সঠিক ৬৪ ক্যারেক্টার)
 BINANCE_API_KEY = "0QzotPVZt9eAbkMSuPpDSe0OQXwbQqsYM59o7HmrDHlu46ClaAemMNlnDTIXrNke"
 BINANCE_API_SECRET = "qvhNafkMmHSgsFuOX4bPafqk45bDU1x8HUcasCSDFPBgMd9msH4uoTv2X6CjhQNb"
 
@@ -164,7 +164,7 @@ bot = {
     "total_sells": 0,
     "wins": 0,
     "realized_pnl": 0.0,
-    "history": deque(maxlen=30),
+    "history": deque(maxlen=40),
     "logs": deque(maxlen=25),
     "markets": {}
 }
@@ -189,12 +189,12 @@ def balance_sync_loop():
                 with lock:
                     if err:
                         if err != last_err:
-                            add_log(f"[API লগ] {err}")
+                            add_log(f"[বাইনান্স লগ] {err}")
                             last_err = err
                     else:
                         bot["live_balance"] = bal
                         if last_err:
-                            add_log(f"[বাইনান্স লাইভ] ব্যালেন্স: ${bal:.2f}")
+                            add_log(f"[লাইভ ব্যালেন্স] ${bal:.2f}")
                             last_err = ""
             time.sleep(3)
         except Exception:
@@ -207,7 +207,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CYBERPUNK NEON TERMINAL ULTRA</title>
+<title>CYBERPUNK NEON TERMINAL</title>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
 <style>
@@ -229,6 +229,8 @@ body { background-color: var(--bg); color: var(--text); padding: 8px; min-height
 .mono { font-family: 'JetBrains Mono', monospace; }
 
 .header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 8px; }
+.header-left { display: flex; align-items: center; gap: 8px; }
+.profile-avatar { width: 32px; height: 32px; border-radius: 50%; border: 2px solid var(--cyan); object-fit: cover; }
 .brand { font-size: 13px; font-weight: 900; color: var(--cyan); letter-spacing: 0.5px; }
 
 select { background: var(--panel); color: var(--text); border: 1px solid var(--border-cyan); padding: 4px 6px; border-radius: 6px; font-size: 10px; }
@@ -291,8 +293,14 @@ input:checked + .slider:before { transform: translateX(16px); }
 .btn-off { background: linear-gradient(135deg, var(--red), #ff0077); color: #fff; font-weight: 900; }
 
 .log-box { background: var(--card-bg); border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px; height: 90px; overflow-y: hidden; font-size: 10px; line-height: 1.5; color: var(--cyan); }
+
+/* পূর্ণাঙ্গ উইথ হিস্ট্রি প্যানেল (প্রথম ছবির মতো) */
+.history-full-box {
+  background: var(--panel); border: 1.5px solid var(--border-cyan);
+  border-radius: 10px; padding: 10px; margin-top: 8px; width: 100%;
+}
 .hist-table { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 4px; }
-.hist-table th, .hist-table td { border-bottom: 1px solid var(--border-pink); padding: 4px 2px; text-align: center; }
+.hist-table th, .hist-table td { border-bottom: 1px solid var(--border-pink); padding: 5px 4px; text-align: center; }
 
 .radar-panel {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-around;
@@ -310,7 +318,8 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 <div class="header">
   <div class="header-left">
-    <div class="brand">⚡ CYBERPUNK TRADING TERMINAL ULTRA</div>
+    <img class="profile-avatar" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 24 24' fill='%2300f0ff'><circle cx='12' cy='8' r='4'/><path d='M12 14c-5 0-8 3-8 6v1h16v-1c0-3-3-6-8-6z'/></svg>">
+    <div class="brand">⚡ CYBERPUNK NEON TERMINAL</div>
   </div>
   <div style="display:flex; align-items:center; gap:5px;">
     <select onchange="applyTheme(this.value)">
@@ -329,7 +338,7 @@ input:checked + .slider:before { transform: translateX(16px); }
   <div class="an-card"><div class="an-title">২৪ ঘণ্টার ওভারভিউ</div><div class="an-val mono" id="v-24h-pnl">$0.00</div></div>
   <div class="an-card"><div class="an-title">বাই / সেল</div><div class="an-val mono"><span style="color:var(--green);" id="v-tot-buy">0</span> / <span style="color:var(--red);" id="v-tot-sell">0</span></div></div>
   <div class="an-card"><div class="an-title">উইন রেট</div><div class="an-val mono" id="v-winrate" style="color:var(--cyan);">0%</div></div>
-  <div class="an-card"><div class="an-title">ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--cyan);">$1000.00</div></div>
+  <div class="an-card"><div class="an-title">USDT ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--cyan);">$1000.00</div></div>
 </div>
 
 <div class="market-nav">
@@ -382,7 +391,7 @@ input:checked + .slider:before { transform: translateX(16px); }
       </div>
 
       <div class="toggle-switch-row">
-        <span style="color:var(--green); font-weight:bold;">🛡️ নো-লস মোড:</span>
+        <span style="color:var(--green); font-weight:bold;">🛡️ নো-লস মোড (লাভ ছাড়া সেল নয়):</span>
         <label class="switch">
           <input type="checkbox" id="no-loss-chk" checked onchange="toggleNoLoss(this.checked)">
           <span class="slider"></span>
@@ -395,25 +404,33 @@ input:checked + .slider:before { transform: translateX(16px); }
       <button class="btn btn-save" onclick="saveCurrentConfig(event)">সেটিংস সেভ করুন</button>
       
       <div style="display:flex; gap:5px; margin-bottom:5px;">
-        <button class="btn btn-manual-buy" onclick="instantBuy(event)">বাই টেস্ট</button>
-        <button class="btn btn-manual-sell" onclick="instantSell(event)">সেল / ক্লোজ</button>
+        <button class="btn btn-manual-buy" onclick="instantBuy(event)">তাৎক্ষণিক বাই / এন্ট্রি</button>
+        <button class="btn btn-manual-sell" onclick="instantSell(event)">তীব্র সেল / ক্লোজ</button>
       </div>
       <button id="pwr-btn" class="btn btn-on" onclick="toggleCurrentMarket(event)">চালু করুন (BTC)</button>
     </div>
 
     <div class="box">
-      <div class="box-head">অ্যাকশন ও এরর লগ</div>
+      <div class="box-head">অ্যাকশন ও ট্রেডিং লগ</div>
       <div class="log-box mono" id="logs"></div>
     </div>
-
-    <div class="box">
-      <div class="box-head">লাইভ ট্রেড হিস্ট্রি</div>
-      <table class="hist-table mono">
-        <thead><tr><th>সময়</th><th>কয়েন</th><th>অর্ডার</th><th>PnL</th></tr></thead>
-        <tbody id="hist"></tbody>
-      </table>
-    </div>
   </div>
+</div>
+
+<!-- সম্পূর্ণ স্ক্রিন জুড়ে ট্রেড হিস্ট্রি প্যানেল -->
+<div class="history-full-box mono">
+  <div class="box-head">লাইভ ট্রেড হিস্ট্রি</div>
+  <table class="hist-table">
+    <thead>
+      <tr>
+        <th>সময়</th>
+        <th>কয়েন</th>
+        <th>অর্ডার</th>
+        <th>PnL</th>
+      </tr>
+    </thead>
+    <tbody id="hist"></tbody>
+  </table>
 </div>
 
 <script>
