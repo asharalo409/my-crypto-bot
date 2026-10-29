@@ -27,7 +27,7 @@ sync_binance_time()
 def binance_signed_request(endpoint, method="GET", params=None):
     global time_offset
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key বা Secret পাওয়া যায়নি"
+        return None, "API Key বা Secret সেট করা নেই"
     try:
         if params is None:
             params = {}
@@ -51,7 +51,7 @@ def binance_signed_request(endpoint, method="GET", params=None):
                 return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
             except Exception:
                 continue
-        return None, "সবগুলো এপিআই কানেকশন টাইমআউট হয়েছে"
+        return None, "এপিআই টাইমআউট হয়েছে"
     except Exception as ex:
         return None, str(ex)
 
