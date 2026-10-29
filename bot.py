@@ -53,7 +53,11 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    urls = ["https://data-api.binance.vision/api/v3/time", "https://api.binance.com/api/v3/time"]
+    urls = [
+        "https://api.binance.com/api/v3/time",
+        "https://data-api.binance.vision/api/v3/time",
+        "https://api1.binance.com/api/v3/time"
+    ]
     for ep in urls:
         try:
             req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
@@ -69,7 +73,7 @@ sync_binance_time()
 def binance_signed_request(endpoint, method="GET", params=None):
     global time_offset
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key ফাঁকা"
+        return None, "API Key বা Secret নেই"
     try:
         if params is None:
             params = {}
@@ -79,18 +83,25 @@ def binance_signed_request(endpoint, method="GET", params=None):
         query_string = urllib.parse.urlencode(params)
         signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
         
-        full_url = f"https://api.binance.com{endpoint}?{query_string}&signature={signature}"
-        req = urllib.request.Request(full_url, method=method)
-        req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            return json.loads(resp.read().decode()), None
-    except urllib.error.HTTPError as e:
-        try:
-            err_data = json.loads(e.read().decode())
-            return None, f"Binance {e.code}: {err_data.get('msg', 'Error')}"
-        except Exception:
-            return None, f"HTTP Error {e.code}"
+        base_urls = ["https://api.binance.com", "https://api1.binance.com", "https://api3.binance.com"]
+        for base in base_urls:
+            try:
+                full_url = f"{base}{endpoint}?{query_string}&signature={signature}"
+                req = urllib.request.Request(full_url, method=method)
+                req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
+                req.add_header("User-Agent", "Mozilla/5.0")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return json.loads(resp.read().decode()), None
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode()
+                try:
+                    err_data = json.loads(err_body)
+                    return None, f"Binance {e.code}: {err_data.get('msg', 'Error')}"
+                except Exception:
+                    return None, f"HTTP Error {e.code}: {err_body}"
+            except Exception:
+                continue
+        return None, "এপিআই কানেকশন টাইমআউট"
     except Exception as ex:
         return None, str(ex)
 
@@ -102,17 +113,17 @@ def get_live_balance():
         for b in res["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"]), None
-    return 0.0, "USDT Asset পাওয়া যায়নি"
+    return 0.0, "Spot ওয়ালেটে USDT নেই"
 
 def execute_binance_order(symbol, side, quote_order_qty=None, quantity=None):
     params = {"symbol": symbol, "side": side, "type": "MARKET"}
     if side == "BUY" and quote_order_qty:
-        params["quoteOrderQty"] = f"{quote_order_qty:.2f}"
+        params["quoteOrderQty"] = f"{round(quote_order_qty, 2):.2f}"
     elif side == "SELL":
         if quantity:
-            params["quantity"] = f"{quantity:.5f}"
+            params["quantity"] = f"{round(quantity, 5):.5f}"
         elif quote_order_qty:
-            params["quoteOrderQty"] = f"{quote_order_qty:.2f}"
+            params["quoteOrderQty"] = f"{round(quote_order_qty, 2):.2f}"
     return binance_signed_request("/api/v3/order", method="POST", params=params)
 
 def send_telegram(message):
@@ -123,7 +134,7 @@ def send_telegram(message):
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode('utf-8')
             req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0"})
-            urllib.request.urlopen(req, timeout=4)
+            urllib.request.urlopen(req, timeout=5)
         except Exception:
             pass
     threading.Thread(target=_send, daemon=True).start()
@@ -163,12 +174,12 @@ def balance_sync_loop():
                 with lock:
                     if err:
                         if err != last_err:
-                            add_log(f"[API ত্রুটি] {err}")
+                            add_log(f"[API লগ] {err}")
                             last_err = err
                     else:
                         bot["live_balance"] = bal
                         if last_err:
-                            add_log(f"[লাইভ ব্যালেন্স] ${bal:.2f}")
+                            add_log(f"[বাইনান্স লাইভ] ব্যালেন্স: ${bal:.2f}")
                             last_err = ""
             time.sleep(3)
         except Exception:
@@ -455,7 +466,6 @@ const ch = LightweightCharts.createChart(chartEl, {
 });
 let series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
 
-// ব্রাউজার থেকেই সরাসরি বাইন্যান্স থেকে ডেটা ফেচিং (কোনো আইপি ব্লক হবে না)
 function loadDirectBinanceKlines(sym) {
   fetch('https://api.binance.com/api/v3/klines?symbol=' + sym + '&interval=1m&limit=40')
     .then(r => r.json())
@@ -476,7 +486,6 @@ function loadDirectBinanceKlines(sym) {
         }
       }
     }).catch(err => {
-      // ব্যাকআপ পাবলিক প্রক্সি
       fetch('https://data-api.binance.vision/api/v3/klines?symbol=' + sym + '&interval=1m&limit=40')
         .then(r => r.json())
         .then(klines => {
@@ -502,7 +511,6 @@ function syncPriceToServer(sym, price) {
   });
 }
 
-// সকল কয়েনের প্রাইস ব্রাউজার থেকেই সেকেন্ডে আনা
 function fetchAllPricesDirect() {
   fetch('https://api.binance.com/api/v3/ticker/price')
     .then(r => r.json())
@@ -527,7 +535,6 @@ function fetchAllPricesDirect() {
       }
     });
 
-  // অর্ডারবুক ফেচ
   fetch('https://api.binance.com/api/v3/depth?symbol=' + activeSymbol + '&limit=5')
     .then(r => r.json())
     .then(d => {
@@ -728,7 +735,15 @@ class CompleteRouter(BaseHTTPRequestHandler):
             p = float(data.get("price", 0))
             with lock:
                 if sym in bot["markets"]:
-                    bot["markets"][sym]["price"] = p
+                    m = bot["markets"][sym]
+                    m["price"] = p
+                    orders = m["dca_orders"]
+                    if len(orders) > 0 and p > 0:
+                        total_qty = sum(o["qty"] for o in orders)
+                        total_cost = sum(o["cost"] for o in orders)
+                        avg_price = total_cost / total_qty
+                        diff = ((p - avg_price) / avg_price) * 100
+                        m["unrealized_pnl"] = round(diff, 2)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -744,17 +759,32 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     if p <= 0:
                         p = m["price"]
                     amt = m["amount"]
+                    success = True
                     if bot["live_mode"]:
-                        execute_binance_order(sym, "BUY", quote_order_qty=amt)
+                        res, err = execute_binance_order(sym, "BUY", quote_order_qty=amt)
+                        if err:
+                            add_log(f"[{sym}] ❌ লাইভ বাই ব্যর্থ: {err}")
+                            success = False
+                        else:
+                            add_log(f"[{sym}] 🟢 [LIVE] বাই কার্যকর @ ${p:.2f}")
+                            send_telegram(f"⚡ [LIVE BUY] {sym} @ ${p:.4f}")
                     else:
                         bot["demo_balance"] -= amt
+                        add_log(f"[{sym}] 🟢 [DEMO] বাই কার্যকর @ ${p:.2f}")
 
-                    m["dca_orders"].append({"price": p, "qty": amt / p if p > 0 else 0, "cost": amt})
-                    m["position"] = {"buy_price": p, "amount": amt}
-                    bot["total_buys"] += 1
-                    add_log(f"[{sym}] ম্যানুয়াল বাই @ ${p:.2f}")
-                    send_telegram(f"⚡ [MANUAL BUY] {sym} @ ${p:.4f}")
-                    log_trade_db(sym, "BUY", p, 0.0, 0.0, "Manual Buy")
+                    if success:
+                        qty = amt / p if p > 0 else 0
+                        m["dca_orders"].append({"price": p, "qty": qty, "cost": amt})
+                        m["position"] = {"buy_price": p, "amount": amt}
+                        bot["total_buys"] += 1
+                        log_trade_db(sym, "BUY", p, 0.0, 0.0, "Manual Buy")
+                        bot["history"].appendleft({
+                            "time": time.strftime("%H:%M:%S"),
+                            "symbol": sym,
+                            "side": "BUY",
+                            "price": round(p, 4),
+                            "pnl": 0.0
+                        })
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -775,18 +805,39 @@ class CompleteRouter(BaseHTTPRequestHandler):
                         total_cost = sum(o["cost"] for o in orders)
                         profit = (total_qty * p) - total_cost
                         diff = ((p - (total_cost / total_qty)) / (total_cost / total_qty)) * 100
+                        success = True
                         if bot["live_mode"]:
-                            execute_binance_order(sym, "SELL", quantity=total_qty)
+                            res, err = execute_binance_order(sym, "SELL", quantity=total_qty)
+                            if err:
+                                add_log(f"[{sym}] ❌ লাইভ সেল ব্যর্থ: {err}")
+                                success = False
+                            else:
+                                bot["realized_pnl"] += profit
+                                bot["total_sells"] += 1
+                                if profit > 0:
+                                    bot["wins"] += 1
+                                add_log(f"[{sym}] 🔴 [LIVE] সেল সফল: {profit:+.2f}$ ({diff:+.2f}%)")
+                                send_telegram(f"🎯 [LIVE SELL] {sym} @ ${p:.4f} PnL: {diff:+.2f}%")
                         else:
                             bot["demo_balance"] += (total_cost + profit)
+                            bot["realized_pnl"] += profit
+                            bot["total_sells"] += 1
+                            if profit > 0:
+                                bot["wins"] += 1
+                            add_log(f"[{sym}] 🔴 [DEMO] সেল: {profit:+.2f}$ ({diff:+.2f}%)")
 
-                        bot["realized_pnl"] += profit
-                        bot["total_sells"] += 1
-                        add_log(f"[{sym}] ম্যানুয়াল সেল: {profit:+.2f}$")
-                        send_telegram(f"🎯 [MANUAL SELL] {sym} @ ${p:.4f} PnL: {diff:+.2f}%")
-                        log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Sell")
-                        m["dca_orders"] = []
-                        m["position"] = None
+                        if success:
+                            log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Sell")
+                            bot["history"].appendleft({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": "SELL",
+                                "price": round(p, 4),
+                                "pnl": round(diff, 2)
+                            })
+                            m["dca_orders"] = []
+                            m["position"] = None
+                            m["unrealized_pnl"] = 0.0
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -825,6 +876,10 @@ class CompleteRouter(BaseHTTPRequestHandler):
                 bot["live_mode"] = not bot["live_mode"]
                 mode = "LIVE" if bot["live_mode"] else "DEMO"
                 add_log(f"ট্রেডিং মোড: {mode}")
+                if bot["live_mode"]:
+                    bal, err = get_live_balance()
+                    if not err:
+                        bot["live_balance"] = bal
                 res = {"live_mode": bot["live_mode"]}
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
