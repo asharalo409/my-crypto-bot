@@ -41,7 +41,7 @@ init_db()
 lock = threading.RLock()
 
 bot = {
-    "live_mode": True,
+    "live_mode": False,   # শুরুতে ডেমো মোডে থাকবে যাতে $1000 ডেমো ব্যালেন্স দেখতে পান
     "demo_balance": 1000.0,
     "live_balance": 0.0,
     "total_buys": 0,
@@ -77,12 +77,12 @@ def balance_sync_loop():
             with lock:
                 if err:
                     if err != last_err:
-                        add_log(f"[API ত্রুটি] {err}")
+                        add_log(f"[API লগ] {err}")
                         last_err = err
                 else:
                     bot["live_balance"] = bal
                     if last_err:
-                        add_log(f"[লাইভ ব্যালেন্স] ${bal:.2f}")
+                        add_log(f"[বাইনান্স লাইভ] ব্যালেন্স: ${bal:.2f}")
                         last_err = ""
             time.sleep(3)
         except Exception:
@@ -137,6 +137,9 @@ def market_engine(symbol):
                         buy_amt = m["amount"]
                         if bot["live_mode"]:
                             execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
+                        else:
+                            bot["demo_balance"] -= buy_amt  # ডেমো ব্যালেন্স থেকে টাকা কাটবে
+
                         orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
                         bot["total_buys"] += 1
                         m["cooldown_until"] = now + 15
@@ -151,7 +154,7 @@ def market_engine(symbol):
                         if bot["live_mode"]:
                             execute_binance_order(symbol, "SELL", quantity=total_qty)
                         else:
-                            bot["demo_balance"] += profit
+                            bot["demo_balance"] += revenue  # ডেমো ব্যালেন্সে আসল টাকা + লাভ ফেরত আসবে
 
                         bot["realized_pnl"] += profit
                         bot["total_sells"] += 1
@@ -182,6 +185,8 @@ def market_engine(symbol):
                         buy_amt = m["amount"]
                         if bot["live_mode"]:
                             execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
+                        else:
+                            bot["demo_balance"] -= buy_amt  # ডেমো ব্যালেন্স থেকে টাকা কাটবে
 
                         m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
                         m["position"] = {"buy_price": price, "amount": buy_amt}
@@ -263,6 +268,9 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     amt = m["amount"]
                     if bot["live_mode"]:
                         execute_binance_order(sym, "BUY", quote_order_qty=amt)
+                    else:
+                        bot["demo_balance"] -= amt  # ডেমো ব্যালেন্স থেকে কাটা হবে
+
                     m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
                     m["position"] = {"buy_price": p, "amount": amt}
                     bot["total_buys"] += 1
@@ -287,12 +295,14 @@ class CompleteRouter(BaseHTTPRequestHandler):
                         p = m["price"]
                         total_qty = sum(o["qty"] for o in orders)
                         total_cost = sum(o["cost"] for o in orders)
-                        profit = (total_qty * p) - total_cost
+                        revenue = total_qty * p
+                        profit = revenue - total_cost
                         diff = ((p - (total_cost / total_qty)) / (total_cost / total_qty)) * 100
                         if bot["live_mode"]:
                             execute_binance_order(sym, "SELL", quantity=total_qty)
                         else:
-                            bot["demo_balance"] += profit
+                            bot["demo_balance"] += revenue  # ডেমো ব্যালেন্সে টাকা যোগ হবে
+
                         bot["realized_pnl"] += profit
                         bot["total_sells"] += 1
                         add_log(f"[{sym}] ম্যানুয়াল সেল: {profit:+.2f}$")
