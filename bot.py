@@ -169,7 +169,7 @@ sync_binance_time()
 def binance_signed_request(endpoint, method="GET", params=None):
     global BINANCE_API_KEY, BINANCE_API_SECRET, time_offset
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        return None, "API Key বা Secret সেট করা নেই"
+        return None, "API Key বা Secret প্রদান করা হয়নি"
     try:
         if params is None:
             params = {}
@@ -189,11 +189,14 @@ def binance_signed_request(endpoint, method="GET", params=None):
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     return json.loads(resp.read().decode()), None
             except urllib.error.HTTPError as e:
-                err_data = json.loads(e.read().decode())
-                return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
+                try:
+                    err_data = json.loads(e.read().decode())
+                    return None, f"Binance Error {e.code}: {err_data.get('msg', 'Unknown')}"
+                except Exception:
+                    return None, f"Binance Error {e.code}"
             except Exception:
                 continue
-        return None, "সকল ব্যাকআপ এপিআই কানেকশন টাইমআউট হয়েছে"
+        return None, "API কানেকশন টাইমআউট হয়েছে"
     except Exception as ex:
         return None, str(ex)
 
@@ -205,51 +208,23 @@ def get_live_balance():
         for b in res["balances"]:
             if b["asset"] == "USDT":
                 return float(b["free"]), None
-    return 0.0, "USDT ব্যালেন্স পাওয়া যায়নি"
+    return 0.0, "USDT Asset পাওয়া যায়নি"
 
-def get_analytics_metrics():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        coin_stats = {}
-        for sym in SYMBOLS:
-            c.execute("SELECT COUNT(*), COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE symbol=? AND side='SELL'", (sym,))
-            cr = c.fetchone()
-            coin_stats[sym] = {"trades": cr[0] or 0, "profit": round(cr[1] or 0.0, 3)}
+def execute_binance_order(symbol, side, quote_order_qty=None, quantity=None):
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET"
+    }
+    if side == "BUY" and quote_order_qty:
+        params["quoteOrderQty"] = f"{quote_order_qty:.2f}"
+    elif side == "SELL":
+        if quantity:
+            params["quantity"] = f"{quantity:.5f}"
+        elif quote_order_qty:
+            params["quoteOrderQty"] = f"{quote_order_qty:.2f}"
 
-        now = datetime.now()
-        hourly_labels = []
-        hourly_values = []
-        for i in range(23, -1, -1):
-            h_start = (now - timedelta(hours=i+1)).strftime("%Y-%m-%d %H:%M:%S")
-            h_end = (now - timedelta(hours=i)).strftime("%Y-%m-%d %H:%M:%S")
-            c.execute("SELECT COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE side='SELL' AND timestamp >= ? AND timestamp < ?", (h_start, h_end))
-            val = round(c.fetchone()[0] or 0.0, 3)
-            hourly_labels.append((now - timedelta(hours=i)).strftime("%H:00"))
-            hourly_values.append(val)
-
-        daily_labels = []
-        daily_values = []
-        for i in range(6, -1, -1):
-            d_start = (now - timedelta(days=i+1)).strftime("%Y-%m-%d 00:00:00")
-            d_end = (now - timedelta(days=i)).strftime("%Y-%m-%d 23:59:59")
-            c.execute("SELECT COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE side='SELL' AND timestamp >= ? AND timestamp <= ?", (d_start, d_end))
-            val = round(c.fetchone()[0] or 0.0, 3)
-            daily_labels.append((now - timedelta(days=i)).strftime("%d %b"))
-            daily_values.append(val)
-
-        conn.close()
-        return {
-            "coin_stats": coin_stats,
-            "hourly_chart": {"labels": hourly_labels, "data": hourly_values},
-            "daily_chart": {"labels": daily_labels, "data": daily_values}
-        }
-    except Exception:
-        return {
-            "coin_stats": {s: {"trades": 0, "profit": 0.0} for s in SYMBOLS},
-            "hourly_chart": {"labels": [], "data": []},
-            "daily_chart": {"labels": [], "data": []}
-        }
+    return binance_signed_request("/api/v3/order", method="POST", params=params)
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -316,7 +291,7 @@ def balance_sync_loop():
                 with lock:
                     if err:
                         if err != last_err:
-                            add_log(f"[API লগ] {err}")
+                            add_log(f"[API ব্যালেন্স ত্রুটি] {err}")
                             last_err = err
                     else:
                         bot["live_balance"] = bal
@@ -403,45 +378,81 @@ def market_engine(symbol):
                     last_buy = orders[-1]["price"]
                     if (price <= last_buy * 0.985) and (len(orders) < 3) and (now > m["cooldown_until"]):
                         buy_amt = m["amount"]
-                        orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
-                        bot["total_buys"] += 1
-                        m["cooldown_until"] = now + 15
-                        bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                        add_log(f"[{symbol}] 🟢 DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
-                        send_telegram(f"⚡ *[DCA BUY #{len(orders)}]* {symbol}\nPrice: `${price:.4f}`")
-                        save_state()
+                        if bot["live_mode"]:
+                            res, err = execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
+                            if err:
+                                add_log(f"[{symbol}] ❌ লাইভ বাই ব্যর্থ: {err}")
+                            else:
+                                orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
+                                bot["total_buys"] += 1
+                                m["cooldown_until"] = now + 15
+                                bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
+                                add_log(f"[{symbol}] 🟢 [LIVE] DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
+                                send_telegram(f"⚡ *[LIVE DCA BUY #{len(orders)}]* {symbol}\nPrice: `${price:.4f}`")
+                                save_state()
+                        else:
+                            orders.append({"price": price, "qty": buy_amt / price, "cost": buy_amt})
+                            bot["total_buys"] += 1
+                            m["cooldown_until"] = now + 15
+                            bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
+                            add_log(f"[{symbol}] 🟢 [DEMO] DCA ডিপ বাই #{len(orders)} @ ${price:.4f}")
+                            save_state()
 
                     elif is_tp or is_sl:
                         revenue = total_qty * price
                         profit = revenue - total_cost
-                        bot["demo_balance"] += profit
-                        bot["realized_pnl"] += profit
-                        bot["pnl_1h"] += profit
-                        bot["pnl_24h"] += profit
-                        bot["total_sells"] += 1
-                        bot["trades_1h"] += 1
-                        bot["trades_24h"] += 1
-                        if profit > 0:
-                            bot["wins"] += 1
-                        save_state()
-
                         side_name = "TAKE PROFIT" if diff > 0 else "STOP LOSS"
-                        bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
-                        add_log(f"[{symbol}] 🔴 {side_name} ({len(orders)}x DCA): {profit:+.2f}$ ({diff:+.2f}%)")
-                        send_telegram(f"🎯 *[{side_name}]* {symbol}\nExit: `${price:.4f}`\nPnL: `{diff:+.2f}%`")
-                        log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), f"{side_name} ({len(orders)}x DCA)")
-                        
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": symbol,
-                            "side": f"SELL({len(orders)}x)",
-                            "price": round(price, 4),
-                            "pnl": round(diff, 2)
-                        })
-                        m["dca_orders"] = []
-                        m["position"] = None
-                        m["unrealized_pnl"] = 0.0
-                        m["cooldown_until"] = now + 10
+
+                        if bot["live_mode"]:
+                            res, err = execute_binance_order(symbol, "SELL", quantity=total_qty)
+                            if err:
+                                add_log(f"[{symbol}] ❌ লাইভ সেল ব্যর্থ: {err}")
+                            else:
+                                bot["realized_pnl"] += profit
+                                bot["pnl_1h"] += profit
+                                bot["pnl_24h"] += profit
+                                bot["total_sells"] += 1
+                                if profit > 0:
+                                    bot["wins"] += 1
+                                save_state()
+                                bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
+                                add_log(f"[{symbol}] 🔴 [LIVE] {side_name}: {profit:+.2f}$ ({diff:+.2f}%)")
+                                send_telegram(f"🎯 *[LIVE {side_name}]* {symbol}\nExit: `${price:.4f}`\nPnL: `{diff:+.2f}%`")
+                                log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), f"LIVE {side_name}")
+                                bot["history"].appendleft({
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "symbol": symbol,
+                                    "side": f"SELL({len(orders)}x)",
+                                    "price": round(price, 4),
+                                    "pnl": round(diff, 2)
+                                })
+                                m["dca_orders"] = []
+                                m["position"] = None
+                                m["unrealized_pnl"] = 0.0
+                                m["cooldown_until"] = now + 10
+                        else:
+                            bot["demo_balance"] += profit
+                            bot["realized_pnl"] += profit
+                            bot["pnl_1h"] += profit
+                            bot["pnl_24h"] += profit
+                            bot["total_sells"] += 1
+                            if profit > 0:
+                                bot["wins"] += 1
+                            save_state()
+                            bot["last_radar_event"] = {"symbol": symbol, "type": "SELL", "time": time.time()}
+                            add_log(f"[{symbol}] 🔴 [DEMO] {side_name}: {profit:+.2f}$ ({diff:+.2f}%)")
+                            log_trade_db(symbol, "SELL", price, round(diff, 2), round(profit, 4), f"DEMO {side_name}")
+                            bot["history"].appendleft({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": symbol,
+                                "side": f"SELL({len(orders)}x)",
+                                "price": round(price, 4),
+                                "pnl": round(diff, 2)
+                            })
+                            m["dca_orders"] = []
+                            m["position"] = None
+                            m["unrealized_pnl"] = 0.0
+                            m["cooldown_until"] = now + 10
 
                     m["position"] = {"buy_price": avg_price, "amount": total_cost} if len(orders) > 0 else None
 
@@ -449,23 +460,43 @@ def market_engine(symbol):
                     active_positions = sum(1 for k in bot["markets"].values() if len(k["dca_orders"]) > 0)
                     if (now > m["cooldown_until"]) and (active_positions < MAX_OPEN_POSITIONS):
                         buy_amt = m["amount"]
-                        m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
-                        m["position"] = {"buy_price": price, "amount": buy_amt}
-                        m["unrealized_pnl"] = 0.0
-                        bot["total_buys"] += 1
-                        bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
-                        save_state()
-                        
-                        add_log(f"[{symbol}] 🟢 বেস বাই @ ${price:.4f}")
-                        send_telegram(f"⚡ *[BASE BUY]* {symbol}\nPrice: `${price:.4f}`")
-                        log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Base Entry")
-                        bot["history"].appendleft({
-                            "time": time.strftime("%H:%M:%S"),
-                            "symbol": symbol,
-                            "side": "BUY",
-                            "price": round(price, 4),
-                            "pnl": 0.0
-                        })
+                        if bot["live_mode"]:
+                            res, err = execute_binance_order(symbol, "BUY", quote_order_qty=buy_amt)
+                            if err:
+                                add_log(f"[{symbol}] ❌ লাইভ বেস বাই ব্যর্থ: {err}")
+                            else:
+                                m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
+                                m["position"] = {"buy_price": price, "amount": buy_amt}
+                                m["unrealized_pnl"] = 0.0
+                                bot["total_buys"] += 1
+                                bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
+                                save_state()
+                                add_log(f"[{symbol}] 🟢 [LIVE] বেস বাই @ ${price:.4f}")
+                                send_telegram(f"⚡ *[LIVE BASE BUY]* {symbol}\nPrice: `${price:.4f}`")
+                                log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Live Base")
+                                bot["history"].appendleft({
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "symbol": symbol,
+                                    "side": "BUY",
+                                    "price": round(price, 4),
+                                    "pnl": 0.0
+                                })
+                        else:
+                            m["dca_orders"] = [{"price": price, "qty": buy_amt / price, "cost": buy_amt}]
+                            m["position"] = {"buy_price": price, "amount": buy_amt}
+                            m["unrealized_pnl"] = 0.0
+                            bot["total_buys"] += 1
+                            bot["last_radar_event"] = {"symbol": symbol, "type": "BUY", "time": time.time()}
+                            save_state()
+                            add_log(f"[{symbol}] 🟢 [DEMO] বেস বাই @ ${price:.4f}")
+                            log_trade_db(symbol, "BUY", price, 0.0, 0.0, "Demo Base")
+                            bot["history"].appendleft({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": symbol,
+                                "side": "BUY",
+                                "price": round(price, 4),
+                                "pnl": 0.0
+                            })
 
             time.sleep(1.2)
         except Exception:
@@ -481,37 +512,34 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CYBERPUNK NEON TERMINAL ULTRA</title>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #03000a; --panel: rgba(14, 5, 29, 0.96); --cyan: #00f0ff; --purple: #ff0077;
   --green: #00ff66; --red: #ff0044; --border-cyan: #00f0ff; --border-pink: #ff0077;
-  --text: #ffffff; --text-dim: #a1a1aa;
+  --text: #ffffff; --text-dim: #a1a1aa; --card-bg: #081026;
 }
-[data-theme="binance"] { --bg: #121418; --panel: #1e2329; --cyan: #fcd535; --purple: #fcd535; --green: #0ecb81; --red: #f6465d; --border-cyan: #2b313a; --border-pink: #fcd535; }
-[data-theme="tokyo"] { --bg: #131224; --panel: #1c1a35; --cyan: #c77dff; --purple: #ff5400; --green: #70e000; --red: #ff0054; --border-cyan: #9d4edd; --border-pink: #ff5400; }
-[data-theme="matrix"] { --bg: #020b05; --panel: #05180b; --cyan: #00ff41; --purple: #00ff41; --green: #00ff41; --red: #ff3333; --border-cyan: #00ff41; --border-pink: #00ff41; }
-[data-theme="oled"] { --bg: #000000; --panel: #0d0d0d; --cyan: #3b82f6; --purple: #3b82f6; --green: #22c55e; --red: #ef4444; --border-cyan: #262626; --border-pink: #3b82f6; }
+[data-theme="white"] {
+  --bg: #f4f6f9; --panel: #ffffff; --cyan: #0066cc; --purple: #8b5cf6;
+  --green: #10b981; --red: #ef4444; --border-cyan: #cbd5e1; --border-pink: #e2e8f0;
+  --text: #0f172a; --text-dim: #64748b; --card-bg: #f8fafc;
+}
+[data-theme="binance"] { --bg: #121418; --panel: #1e2329; --cyan: #fcd535; --purple: #fcd535; --green: #0ecb81; --red: #f6465d; --border-cyan: #2b313a; --border-pink: #fcd535; --card-bg: #181a20; }
+[data-theme="oled"] { --bg: #000000; --panel: #0d0d0d; --cyan: #3b82f6; --purple: #3b82f6; --green: #22c55e; --red: #ef4444; --border-cyan: #262626; --border-pink: #3b82f6; --card-bg: #111111; }
 
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; }
 body { background-color: var(--bg); color: var(--text); padding: 8px; min-height: 100vh; }
 .mono { font-family: 'JetBrains Mono', monospace; }
-.icon { width: 14px; height: 14px; vertical-align: middle; fill: currentColor; display: inline-block; }
 
-.header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 8px; box-shadow: 0 0 10px rgba(255, 0, 119, 0.4); }
+.header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 2px solid var(--border-pink); padding: 8px 12px; border-radius: 12px; margin-bottom: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
 .header-left { display: flex; align-items: center; gap: 8px; }
 .profile-avatar { width: 34px; height: 34px; border-radius: 50%; border: 2px solid var(--cyan); object-fit: cover; }
-.brand { font-size: 13px; font-weight: 900; color: var(--cyan); letter-spacing: 0.5px; display: flex; align-items: center; gap: 5px; }
+.brand { font-size: 13px; font-weight: 900; color: var(--cyan); letter-spacing: 0.5px; }
 
-select { background: #000; color: #fff; border: 1px solid var(--border-cyan); padding: 4px 6px; border-radius: 6px; font-size: 10px; }
+select { background: var(--panel); color: var(--text); border: 1px solid var(--border-cyan); padding: 4px 6px; border-radius: 6px; font-size: 10px; }
 .mode-badge { padding: 5px 12px; border-radius: 8px; font-weight: 800; font-size: 10px; cursor: pointer; transition: 0.2s; user-select: none; }
 .mode-demo { background: rgba(0, 240, 255, 0.2); color: var(--cyan); border: 1.5px solid var(--cyan); }
 .mode-live { background: rgba(255, 0, 68, 0.35); color: #fff; border: 1.5px solid var(--red); box-shadow: 0 0 10px rgba(255,0,68,0.5); }
-
-.page-nav { display: flex; gap: 8px; margin-bottom: 8px; }
-.page-tab-btn { flex: 1; padding: 8px; border-radius: 8px; border: 1.5px solid rgba(255, 0, 119, 0.5); background: var(--panel); color: var(--text-dim); font-weight: 800; font-size: 11px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
-.page-tab-btn.active { background: rgba(0, 240, 255, 0.2); border-color: var(--cyan); color: var(--cyan); }
 
 .analytics-panel { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin-bottom: 8px; }
 @media(max-width: 600px) { .analytics-panel { grid-template-columns: repeat(3, 1fr); } }
@@ -521,15 +549,12 @@ select { background: #000; color: #fff; border: 1px solid var(--border-cyan); pa
 
 .market-nav { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; margin-bottom: 8px; overflow-x: auto; }
 @media(max-width: 600px) { .market-nav { grid-template-columns: repeat(4, 1fr); } }
-.market-tab { background: var(--panel); border: 1.5px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 6px 2px; cursor: pointer; text-align: center; }
-.market-tab.active { background: rgba(255, 0, 119, 0.25); border-color: var(--purple); box-shadow: 0 0 8px rgba(255,0,119,0.3); }
+.market-tab { background: var(--panel); border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px 2px; cursor: pointer; text-align: center; }
+.market-tab.active { background: rgba(0, 240, 255, 0.15); border-color: var(--cyan); box-shadow: 0 0 8px rgba(0,240,255,0.3); }
 .tab-name { font-size: 10px; font-weight: 900; }
 .tab-price { font-size: 8.5px; font-weight: 700; color: var(--cyan); margin-top: 1px; }
 .tab-status { font-size: 7.5px; margin-top: 1px; font-weight: bold; }
 .tab-dca-badge { font-size: 7px; color: var(--cyan); margin-top: 1px; font-weight: bold; }
-
-.view-section { display: none; }
-.view-section.active { display: block; }
 
 .main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; }
 @media(max-width: 860px) { .main-grid { grid-template-columns: 1fr; } }
@@ -542,7 +567,7 @@ select { background: #000; color: #fff; border: 1px solid var(--border-cyan); pa
 .chart-type-btn { background: transparent; border: 1px solid var(--border-cyan); color: var(--text); padding: 2px 6px; border-radius: 4px; font-size: 9px; cursor: pointer; }
 .chart-type-btn.active { background: var(--cyan); color: #000; font-weight: bold; }
 
-.sentiment-box { margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(255, 0, 119, 0.3); }
+.sentiment-box { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border-pink); }
 .bar-wrap { height: 6px; width: 100%; background: var(--red); border-radius: 4px; overflow: hidden; margin: 4px 0; display: flex; }
 .bar-fill { height: 100%; background: var(--green); transition: width 0.4s ease; }
 
@@ -552,7 +577,7 @@ select { background: #000; color: #fff; border: 1px solid var(--border-cyan); pa
 .ob-table td:last-child { text-align: right; color: var(--text-dim); }
 
 .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11px; }
-.row input { width: 80px; text-align: center; background: #000; color: var(--cyan); border: 1.5px solid var(--border-cyan); padding: 4px; border-radius: 4px; font-weight: bold; }
+.row input { width: 80px; text-align: center; background: var(--card-bg); color: var(--cyan); border: 1.5px solid var(--border-cyan); padding: 4px; border-radius: 4px; font-weight: bold; }
 
 .toggle-switch-row {
   display: flex; justify-content: space-between; align-items: center;
@@ -567,28 +592,28 @@ input:checked + .slider { background-color: var(--green); }
 input:checked + .slider:before { transform: translateX(16px); }
 
 .api-vault-btn { background: rgba(0, 240, 255, 0.15); color: var(--cyan); border: 1.5px solid var(--cyan); border-radius: 6px; padding: 8px 10px; width: 100%; font-size: 11px; font-weight: 800; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; margin-bottom: 8px; }
-.api-vault-modal { display: none; background: rgba(0,0,0,0.95); border: 2px solid var(--purple); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.api-vault-modal input { width: 100%; margin-bottom: 6px; padding: 6px; font-size: 11px; background: #000; color: #fff; border: 1px solid var(--border-pink); border-radius: 4px; }
+.api-vault-modal { display: none; background: var(--panel); border: 2px solid var(--border-pink); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.api-vault-modal input { width: 100%; margin-bottom: 6px; padding: 6px; font-size: 11px; background: var(--card-bg); color: var(--text); border: 1px solid var(--border-cyan); border-radius: 4px; }
 
 .btn { width: 100%; padding: 8px; border: none; border-radius: 6px; font-weight: 800; cursor: pointer; font-size: 11px; margin-top: 4px; }
-.btn-save { background: rgba(255, 0, 119, 0.3); color: #fff; border: 1.5px solid var(--purple); margin-bottom: 5px; }
+.btn-save { background: rgba(0, 240, 255, 0.3); color: var(--cyan); border: 1.5px solid var(--cyan); margin-bottom: 5px; }
 .btn-manual-buy { background: rgba(0, 255, 102, 0.25); color: var(--green); border: 1.5px solid var(--green); }
-.btn-manual-sell { background: rgba(255, 0, 68, 0.3); color: #fff; border: 1.5px solid var(--red); }
+.btn-manual-sell { background: rgba(255, 0, 68, 0.3); color: var(--red); border: 1.5px solid var(--red); }
 .btn-on { background: linear-gradient(135deg, var(--green), #00f0ff); color: #021208; font-weight: 900; }
-.btn-off { background: linear-gradient(135deg, var(--red), var(--purple)); color: #fff; font-weight: 900; }
+.btn-off { background: linear-gradient(135deg, var(--red), #ff0077); color: #fff; font-weight: 900; }
 
-.log-box { background: #000; border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px; height: 90px; overflow-y: hidden; font-size: 10px; line-height: 1.5; color: var(--cyan); }
+.log-box { background: var(--card-bg); border: 1.5px solid var(--border-pink); border-radius: 6px; padding: 6px; height: 90px; overflow-y: hidden; font-size: 10px; line-height: 1.5; color: var(--cyan); }
 .hist-table { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 4px; }
-.hist-table th, .hist-table td { border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding: 4px 2px; text-align: center; }
+.hist-table th, .hist-table td { border-bottom: 1px solid var(--border-pink); padding: 4px 2px; text-align: center; }
 
 .radar-panel {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-around;
-  background: rgba(3, 10, 24, 0.95); border: 1.5px solid var(--cyan);
+  background: var(--panel); border: 1.5px solid var(--cyan);
   border-radius: 10px; padding: 12px; margin-top: 10px;
 }
 .radar-canvas-box { text-align: center; }
 #masterRadar {
-  background: radial-gradient(circle, #022033 0%, #030a17 80%);
+  background: var(--card-bg);
   border-radius: 50%; border: 2px solid var(--cyan);
 }
 .radar-hud-grid {
@@ -597,7 +622,7 @@ input:checked + .slider:before { transform: translateX(16px); }
 }
 @media(max-width: 600px) { .radar-hud-grid { grid-template-columns: repeat(2, 1fr); margin-left: 0; margin-top: 10px; } }
 .hud-coin-card {
-  background: #081026; border: 1px solid #1e293b; border-radius: 6px;
+  background: var(--card-bg); border: 1px solid var(--border-cyan); border-radius: 6px;
   padding: 6px; text-align: center;
 }
 </style>
@@ -607,14 +632,13 @@ input:checked + .slider:before { transform: translateX(16px); }
 <div class="header">
   <div class="header-left">
     <img id="user-avatar" class="profile-avatar" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='34' height='34' viewBox='0 0 24 24' fill='%2300f0ff'><circle cx='12' cy='8' r='4'/><path d='M12 14c-5 0-8 3-8 6v1h16v-1c0-3-3-6-8-6z'/></svg>">
-    <div class="brand">⚡ CYBERPUNK NEON ULTRA</div>
+    <div class="brand">⚡ CYBERPUNK TRADING TERMINAL</div>
   </div>
   <div style="display:flex; align-items:center; gap:5px;">
     <select onchange="applyTheme(this.value)">
       <option value="cyberpunk">Cyberpunk Neon</option>
+      <option value="white">Pure White Minimal</option>
       <option value="binance">Binance Dark</option>
-      <option value="tokyo">Tokyo Midnight</option>
-      <option value="matrix">Matrix Green</option>
       <option value="oled">OLED Black</option>
     </select>
     <div class="mode-badge mode-demo" id="mode-toggle" onclick="toggleTradingMode()">DEMO MODE</div>
@@ -735,8 +759,29 @@ let curChartType = "candlestick";
 let chartDataCache = [];
 let chartEl = document.getElementById('chart');
 
+window.addEventListener('load', () => {
+  const k = localStorage.getItem('user_api_key');
+  const s = localStorage.getItem('user_api_sec');
+  if(k) document.getElementById('api-key').value = k;
+  if(s) document.getElementById('api-sec').value = s;
+  if(k && s) {
+    fetch('/api/save_keys', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({key: k, secret: s})
+    });
+  }
+});
+
 function applyTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
+  const isWhite = (t === 'white');
+  ch.applyOptions({
+    layout: {
+      background: { color: isWhite ? '#ffffff' : 'transparent' },
+      textColor: isWhite ? '#0f172a' : '#a1a1aa'
+    }
+  });
 }
 
 function toggleApiVault() {
@@ -756,6 +801,8 @@ function saveApiKeys() {
   const k = document.getElementById('api-key').value.trim();
   const s = document.getElementById('api-sec').value.trim();
   if(!k || !s) { alert('API Key ও Secret পূরণ করুন!'); return; }
+  localStorage.setItem('user_api_key', k);
+  localStorage.setItem('user_api_sec', s);
   fetch('/api/save_keys', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -801,10 +848,6 @@ const ch = LightweightCharts.createChart(chartEl, {
   timeScale: { timeVisible: true, rightOffset: 5 }
 });
 let series = ch.addCandlestickSeries({ upColor: '#00ff66', downColor: '#ff0044', borderVisible: false, wickUpColor: '#00ff66', wickDownColor: '#ff0044' });
-
-window.addEventListener('resize', () => {
-  ch.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
-});
 
 function switchChartType(type, btn) {
   document.querySelectorAll('.chart-type-btn').forEach(b => b.classList.remove('active'));
@@ -1035,7 +1078,6 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     "history": list(bot["history"]),
                     "logs": list(bot["logs"]),
                     "markets": bot["markets"],
-                    "analytics": get_analytics_metrics(),
                     "last_radar_event": bot["last_radar_event"]
                 }
             self.send_response(200)
@@ -1065,13 +1107,41 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     m = bot["markets"][sym]
                     p = m["price"]
                     amt = m["amount"]
-                    m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
-                    m["position"] = {"buy_price": p, "amount": amt}
-                    m["unrealized_pnl"] = 0.0
-                    bot["total_buys"] += 1
-                    save_state()
-                    add_log(f"[{sym}] ম্যানুয়াল বাই @ ${p:.2f}")
-                    log_trade_db(sym, "BUY", p, 0.0, 0.0, "Manual Test")
+                    if bot["live_mode"]:
+                        res, err = execute_binance_order(sym, "BUY", quote_order_qty=amt)
+                        if err:
+                            add_log(f"[{sym}] ❌ লাইভ ম্যানুয়াল বাই ব্যর্থ: {err}")
+                        else:
+                            m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
+                            m["position"] = {"buy_price": p, "amount": amt}
+                            m["unrealized_pnl"] = 0.0
+                            bot["total_buys"] += 1
+                            save_state()
+                            add_log(f"[{sym}] 🟢 [LIVE] ম্যানুয়াল বাই কার্যকর @ ${p:.4f}")
+                            send_telegram(f"⚡ *[LIVE MANUAL BUY]* {sym}\nPrice: `${p:.4f}`\nAmount: `${amt}`")
+                            log_trade_db(sym, "BUY", p, 0.0, 0.0, "Live Manual")
+                            bot["history"].appendleft({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": "BUY",
+                                "price": round(p, 4),
+                                "pnl": 0.0
+                            })
+                    else:
+                        m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
+                        m["position"] = {"buy_price": p, "amount": amt}
+                        m["unrealized_pnl"] = 0.0
+                        bot["total_buys"] += 1
+                        save_state()
+                        add_log(f"[{sym}] 🟢 [DEMO] ম্যানুয়াল বাই কার্যকর @ ${p:.4f}")
+                        log_trade_db(sym, "BUY", p, 0.0, 0.0, "Demo Manual")
+                        bot["history"].appendleft({
+                            "time": time.strftime("%H:%M:%S"),
+                            "symbol": sym,
+                            "side": "BUY",
+                            "price": round(p, 4),
+                            "pnl": 0.0
+                        })
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1093,16 +1163,51 @@ class CompleteRouter(BaseHTTPRequestHandler):
                         revenue = total_qty * p
                         profit = revenue - total_cost
                         diff = ((p - (total_cost / total_qty)) / (total_cost / total_qty)) * 100
-                        bot["demo_balance"] += profit
-                        bot["realized_pnl"] += profit
-                        bot["pnl_1h"] += profit
-                        bot["pnl_24h"] += profit
-                        bot["total_sells"] += 1
-                        save_state()
-                        add_log(f"[{sym}] ম্যানুয়াল ক্লোজ: {profit:+.2f}$")
-                        log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Close")
-                        m["dca_orders"] = []
-                        m["position"] = None
+
+                        if bot["live_mode"]:
+                            res, err = execute_binance_order(sym, "SELL", quantity=total_qty)
+                            if err:
+                                add_log(f"[{sym}] ❌ লাইভ ম্যানুয়াল সেল ব্যর্থ: {err}")
+                            else:
+                                bot["realized_pnl"] += profit
+                                bot["pnl_1h"] += profit
+                                bot["pnl_24h"] += profit
+                                bot["total_sells"] += 1
+                                if profit > 0:
+                                    bot["wins"] += 1
+                                save_state()
+                                add_log(f"[{sym}] 🔴 [LIVE] ম্যানুয়াল সেল সফল: {profit:+.2f}$ ({diff:+.2f}%)")
+                                send_telegram(f"🎯 *[LIVE MANUAL SELL]* {sym}\nPrice: `${p:.4f}`\nPnL: `{diff:+.2f}%`")
+                                log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Live Manual Close")
+                                bot["history"].appendleft({
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "symbol": sym,
+                                    "side": "SELL",
+                                    "price": round(p, 4),
+                                    "pnl": round(diff, 2)
+                                })
+                                m["dca_orders"] = []
+                                m["position"] = None
+                        else:
+                            bot["demo_balance"] += profit
+                            bot["realized_pnl"] += profit
+                            bot["pnl_1h"] += profit
+                            bot["pnl_24h"] += profit
+                            bot["total_sells"] += 1
+                            if profit > 0:
+                                bot["wins"] += 1
+                            save_state()
+                            add_log(f"[{sym}] 🔴 [DEMO] ম্যানুয়াল সেল: {profit:+.2f}$")
+                            log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Demo Manual Close")
+                            bot["history"].appendleft({
+                                "time": time.strftime("%H:%M:%S"),
+                                "symbol": sym,
+                                "side": "SELL",
+                                "price": round(p, 4),
+                                "pnl": round(diff, 2)
+                            })
+                            m["dca_orders"] = []
+                            m["position"] = None
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1130,7 +1235,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
             k = data.get("key", "").strip()
             s = data.get("secret", "").strip()
             save_config(k, s)
-            add_log("API Key ভল্টে সংরক্ষিত হয়েছে")
+            add_log("API Key ক্লাউডে সংরক্ষিত হয়েছে")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
