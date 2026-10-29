@@ -8,15 +8,17 @@ import threading
 import sqlite3
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8080))
 
+# সঠিক ৬৪ অক্ষরের এপিআই কী ও সিক্রেট
 BINANCE_API_KEY = "0QzotPVZt9eAbkMSuPpDSe0OQXwbQqsYM59o7HmrDHlu46ClaAemMNlnDTIXrNke"
 BINANCE_API_SECRET = "qvhNafkMmHSgsFuOX4bPafqk45bDU1x8HUcasCSDFPBgMd9msH4uoTv2X6CjhQNb"
+
 TELEGRAM_TOKEN = "9089337002:AAFDg1eJBFuQzvEkN5FD1gVh8zk1J1WhZdo"
 TELEGRAM_CHAT_ID = "7741119923"
 
@@ -53,11 +55,7 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    urls = [
-        "https://api.binance.com/api/v3/time",
-        "https://data-api.binance.vision/api/v3/time",
-        "https://api1.binance.com/api/v3/time"
-    ]
+    urls = ["https://data-api.binance.vision/api/v3/time", "https://api.binance.com/api/v3/time", "https://api1.binance.com/api/v3/time"]
     for ep in urls:
         try:
             req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
@@ -83,7 +81,7 @@ def binance_signed_request(endpoint, method="GET", params=None):
         query_string = urllib.parse.urlencode(params)
         signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
         
-        base_urls = ["https://api.binance.com", "https://api1.binance.com", "https://api3.binance.com"]
+        base_urls = ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]
         for base in base_urls:
             try:
                 full_url = f"{base}{endpoint}?{query_string}&signature={signature}"
@@ -98,7 +96,7 @@ def binance_signed_request(endpoint, method="GET", params=None):
                     err_data = json.loads(err_body)
                     return None, f"Binance {e.code}: {err_data.get('msg', 'Error')}"
                 except Exception:
-                    return None, f"HTTP Error {e.code}: {err_body}"
+                    return None, f"HTTP Error {e.code}"
             except Exception:
                 continue
         return None, "এপিআই কানেকশন টাইমআউট"
@@ -135,9 +133,28 @@ def send_telegram(message):
             data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode('utf-8')
             req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0"})
             urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass
+        except Exception as ex:
+            add_log(f"[টেলিগ্রাম এরর] {str(ex)}")
     threading.Thread(target=_send, daemon=True).start()
+
+def get_analytics():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        now = datetime.now()
+        h1 = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        d1 = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        c.execute("SELECT COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE side='SELL' AND timestamp >= ?", (h1,))
+        pnl_1h = round(c.fetchone()[0] or 0.0, 2)
+
+        c.execute("SELECT COALESCE(SUM(profit_usd), 0.0) FROM trades WHERE side='SELL' AND timestamp >= ?", (d1,))
+        pnl_24h = round(c.fetchone()[0] or 0.0, 2)
+        
+        conn.close()
+        return pnl_1h, pnl_24h
+    except Exception:
+        return 0.0, 0.0
 
 bot = {
     "live_mode": False,
@@ -147,8 +164,6 @@ bot = {
     "total_sells": 0,
     "wins": 0,
     "realized_pnl": 0.0,
-    "pnl_1h": 0.0,
-    "pnl_24h": 0.0,
     "history": deque(maxlen=30),
     "logs": deque(maxlen=25),
     "markets": {}
@@ -192,7 +207,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CYBERPUNK NEON TERMINAL</title>
+<title>CYBERPUNK NEON TERMINAL ULTRA</title>
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
 <style>
@@ -295,7 +310,7 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 <div class="header">
   <div class="header-left">
-    <div class="brand">⚡ CYBERPUNK TRADING TERMINAL</div>
+    <div class="brand">⚡ CYBERPUNK TRADING TERMINAL ULTRA</div>
   </div>
   <div style="display:flex; align-items:center; gap:5px;">
     <select onchange="applyTheme(this.value)">
@@ -310,8 +325,8 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 <div class="analytics-panel">
   <div class="an-card"><div class="an-title">মোট লাভ / ক্ষতি</div><div class="an-val mono" id="v-all-pnl" style="color:var(--green);">$0.00</div></div>
-  <div class="an-card"><div class="an-title">১ ঘণ্টার লাভ</div><div class="an-val mono" id="v-1h-pnl">$0.00</div></div>
-  <div class="an-card"><div class="an-title">২৪ ঘণ্টার লাভ</div><div class="an-val mono" id="v-24h-pnl">$0.00</div></div>
+  <div class="an-card"><div class="an-title">১ ঘণ্টার ওভারভিউ</div><div class="an-val mono" id="v-1h-pnl">$0.00</div></div>
+  <div class="an-card"><div class="an-title">২৪ ঘণ্টার ওভারভিউ</div><div class="an-val mono" id="v-24h-pnl">$0.00</div></div>
   <div class="an-card"><div class="an-title">বাই / সেল</div><div class="an-val mono"><span style="color:var(--green);" id="v-tot-buy">0</span> / <span style="color:var(--red);" id="v-tot-sell">0</span></div></div>
   <div class="an-card"><div class="an-title">উইন রেট</div><div class="an-val mono" id="v-winrate" style="color:var(--cyan);">0%</div></div>
   <div class="an-card"><div class="an-title">ব্যালেন্স</div><div class="an-val mono" id="v-bal" style="color:var(--cyan);">$1000.00</div></div>
@@ -707,6 +722,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode('utf-8'))
         elif self.path == '/api/status':
+            p1h, p24h = get_analytics()
             with lock:
                 res = {
                     "live_mode": bot["live_mode"],
@@ -716,8 +732,8 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     "total_sells": bot["total_sells"],
                     "wins": bot["wins"],
                     "realized_pnl": bot["realized_pnl"],
-                    "pnl_1h": bot["pnl_1h"],
-                    "pnl_24h": bot["pnl_24h"],
+                    "pnl_1h": p1h,
+                    "pnl_24h": p24h,
                     "history": list(bot["history"]),
                     "logs": list(bot["logs"]),
                     "markets": bot["markets"]
@@ -767,10 +783,11 @@ class CompleteRouter(BaseHTTPRequestHandler):
                             success = False
                         else:
                             add_log(f"[{sym}] 🟢 [LIVE] বাই কার্যকর @ ${p:.2f}")
-                            send_telegram(f"⚡ [LIVE BUY] {sym} @ ${p:.4f}")
+                            send_telegram(f"⚡ [LIVE BUY] {sym}\nPrice: ${p:.4f}\nAmount: ${amt}")
                     else:
                         bot["demo_balance"] -= amt
                         add_log(f"[{sym}] 🟢 [DEMO] বাই কার্যকর @ ${p:.2f}")
+                        send_telegram(f"🧪 [DEMO BUY] {sym}\nPrice: ${p:.4f}\nAmount: ${amt}")
 
                     if success:
                         qty = amt / p if p > 0 else 0
@@ -817,7 +834,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
                                 if profit > 0:
                                     bot["wins"] += 1
                                 add_log(f"[{sym}] 🔴 [LIVE] সেল সফল: {profit:+.2f}$ ({diff:+.2f}%)")
-                                send_telegram(f"🎯 [LIVE SELL] {sym} @ ${p:.4f} PnL: {diff:+.2f}%")
+                                send_telegram(f"🎯 [LIVE SELL] {sym}\nExit: ${p:.4f}\nPnL: {diff:+.2f}%\nProfit: {profit:+.2f}$")
                         else:
                             bot["demo_balance"] += (total_cost + profit)
                             bot["realized_pnl"] += profit
@@ -825,6 +842,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
                             if profit > 0:
                                 bot["wins"] += 1
                             add_log(f"[{sym}] 🔴 [DEMO] সেল: {profit:+.2f}$ ({diff:+.2f}%)")
+                            send_telegram(f"🎯 [DEMO SELL] {sym}\nExit: ${p:.4f}\nPnL: {diff:+.2f}%\nProfit: {profit:+.2f}$")
 
                         if success:
                             log_trade_db(sym, "SELL", p, round(diff, 2), round(profit, 4), "Manual Sell")
