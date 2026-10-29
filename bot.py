@@ -12,11 +12,9 @@ from datetime import datetime
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# সার্ভার কনফিগারেশন
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8080))
 
-# আপনার এপিআই কি ও টেলিগ্রাম টোকেন
 BINANCE_API_KEY = "0QzotPVZt9eAbkMSuPpDSe0OQXwbQqsYM59o7HmrDHlu46ClaAemMNlnDTIXrNke"
 BINANCE_API_SECRET = "qvhNafkMmHSgsFuOX4bPafqk45bDU1x8HUcasCSDFPBgMd9msH4uoTv2X6CjhQNb"
 TELEGRAM_TOKEN = "9089337002:AAFDg1eJBFuQzvEkN5FD1gVh8zk1J1WhZdo"
@@ -55,9 +53,10 @@ time_offset = 0
 
 def sync_binance_time():
     global time_offset
-    for ep in ["https://data-api.binance.vision/api/v3/time", "https://api.binance.com/api/v3/time"]:
+    urls = ["https://api.binance.com/api/v3/time", "https://data-api.binance.vision/api/v3/time", "https://api1.binance.com/api/v3/time"]
+    for ep in urls:
         try:
-            req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
                 time_offset = data["serverTime"] - int(time.time() * 1000)
@@ -79,18 +78,22 @@ def binance_signed_request(endpoint, method="GET", params=None):
         params["recvWindow"] = 60000
         query_string = urllib.parse.urlencode(params)
         signature = hmac.new(BINANCE_API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-        full_url = f"https://api.binance.com{endpoint}?{query_string}&signature={signature}"
-        req = urllib.request.Request(full_url, method=method)
-        req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read().decode()), None
-    except urllib.error.HTTPError as e:
-        try:
-            err_data = json.loads(e.read().decode())
-            return None, f"Binance {e.code}: {err_data.get('msg', 'Error')}"
-        except Exception:
-            return None, f"HTTP Error {e.code}"
+        
+        urls = ["https://api.binance.com", "https://api1.binance.com", "https://api3.binance.com"]
+        for base in urls:
+            try:
+                full_url = f"{base}{endpoint}?{query_string}&signature={signature}"
+                req = urllib.request.Request(full_url, method=method)
+                req.add_header("X-MBX-APIKEY", BINANCE_API_KEY)
+                req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return json.loads(resp.read().decode()), None
+            except urllib.error.HTTPError as e:
+                err_data = json.loads(e.read().decode())
+                return None, f"Binance {e.code}: {err_data.get('msg', 'Error')}"
+            except Exception:
+                continue
+        return None, "কানেকশন টাইমআউট"
     except Exception as ex:
         return None, str(ex)
 
@@ -179,13 +182,42 @@ def balance_sync_loop():
 
 threading.Thread(target=balance_sync_loop, daemon=True).start()
 
+def fetch_market_data(symbol):
+    endpoints = [
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
+        f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40",
+        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
+    ]
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return json.loads(r.read().decode())
+        except Exception:
+            continue
+    return None
+
+def fetch_depth_data(symbol):
+    endpoints = [
+        f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5",
+        f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5"
+    ]
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return json.loads(r.read().decode())
+        except Exception:
+            continue
+    return {"bids": [], "asks": []}
+
 def market_engine(symbol):
     while True:
         try:
-            url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as r:
-                klines = json.loads(r.read().decode())
+            klines = fetch_market_data(symbol)
+            if not klines or len(klines) == 0:
+                time.sleep(2)
+                continue
 
             price = float(klines[-1][4])
             formatted_klines = [
@@ -193,11 +225,7 @@ def market_engine(symbol):
                 for k in klines
             ]
 
-            url_d = f"https://data-api.binance.vision/api/v3/depth?symbol={symbol}&limit=5"
-            req_d = urllib.request.Request(url_d, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_d, timeout=3) as r:
-                depth = json.loads(r.read().decode())
-
+            depth = fetch_depth_data(symbol)
             bids = depth.get("bids", [])
             asks = depth.get("asks", [])
             tot_bids = sum(float(b[1]) for b in bids) if bids else 1.0
@@ -247,7 +275,7 @@ def market_engine(symbol):
                         if bot["live_mode"]:
                             execute_binance_order(symbol, "SELL", quantity=total_qty)
                         else:
-                            bot["demo_balance"] += revenue
+                            bot["demo_balance"] += (total_cost + profit)
 
                         bot["realized_pnl"] += profit
                         bot["total_sells"] += 1
@@ -307,8 +335,8 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CYBERPUNK NEON TERMINAL ULTRA</title>
-<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+<title>CYBERPUNK NEON TERMINAL</title>
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700;800&family=Plus+Jakarta+Sans:wght@600;700;800;900&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -812,7 +840,7 @@ class CompleteRouter(BaseHTTPRequestHandler):
                     else:
                         bot["demo_balance"] -= amt
 
-                    m["dca_orders"].append({"price": p, "qty": amt / p, "cost": amt})
+                    m["dca_orders"].append({"price": p, "qty": amt / p if p > 0 else 0, "cost": amt})
                     m["position"] = {"buy_price": p, "amount": amt}
                     bot["total_buys"] += 1
                     add_log(f"[{sym}] ম্যানুয়াল বাই @ ${p:.2f}")
